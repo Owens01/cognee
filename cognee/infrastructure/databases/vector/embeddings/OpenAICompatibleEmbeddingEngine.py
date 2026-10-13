@@ -1,0 +1,313 @@
+"""
+Embedding engine for OpenAI-compatible API servers (llama.cpp, vLLM, TEI, etc.).
+
+Uses the openai SDK directly instead of litellm to avoid known incompatibilities
+with local embedding servers:
+- litellm sends ``encoding_format: null`` which strict JSON parsers reject
+  (llama.cpp: ``[json.exception.type_error.302] type must be string, but is null``)
+- litellm's response parsing breaks with ``encoding_format: "float"`` on custom
+  ``api_base`` endpoints (``'list' object has no attribute 'model_dump'``)
+
+See: https://docs.litellm.ai/blog/vllm-embeddings-incident
+     https://github.com/BerriAI/litellm/issues/19174
+"""
+
+import asyncio
+import logging
+import math
+import os
+
+import httpx
+import numpy as np
+import openai
+from openai import AsyncOpenAI
+from tenacity import (
+    before_sleep_log,
+    retry,
+    stop_after_delay,
+    wait_exponential_jitter,
+)
+
+from cognee.infrastructure.databases.exceptions import (
+    EmbeddingContextWindowTooSmallError,
+    EmbeddingCredentialsError,
+    EmbeddingException,
+)
+from cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine import (
+    EmbeddingEngine,
+)
+from cognee.infrastructure.databases.vector.embeddings.input_limit import (
+    init_input_limit,
+    litellm_input_limit,
+    sane_limit,
+)
+from cognee.infrastructure.databases.vector.embeddings.retry_config import (
+    embedding_retry_condition,
+)
+from cognee.infrastructure.databases.vector.embeddings.utils import (
+    handle_embedding_response,
+    sanitize_embedding_text_inputs,
+)
+from cognee.infrastructure.llm.exceptions import raise_if_budget_exhausted
+from cognee.infrastructure.llm.tokenizer.resolver import resolve_embedding_tokenizer
+from cognee.modules.observability.get_observe import get_observe
+from cognee.shared.logging_utils import get_logger
+from cognee.shared.rate_limiting import embedding_rate_limiter_context_manager
+
+logger = get_logger("OpenAICompatibleEmbeddingEngine")
+
+observe = get_observe()
+
+
+class OpenAICompatibleEmbeddingEngine(EmbeddingEngine):
+    """
+    Embedding engine for any server that exposes the OpenAI ``/v1/embeddings`` API.
+
+    Designed for local/self-hosted servers such as:
+    - llama.cpp (``llama-server --embedding``)
+    - vLLM
+    - Hugging Face TEI
+    - LocalAI, Infinity, etc.
+
+    Unlike :class:`LiteLLMEmbeddingEngine`, this engine communicates with the server
+    directly via the ``openai`` Python SDK, avoiding litellm's parameter injection
+    and response-parsing issues with custom endpoints.
+
+    Public methods:
+    - embed_text: Embed a list of strings into vector representations.
+    - get_vector_size: Retrieve the size of the embedding vectors.
+    - get_batch_size: Return the configured batch size.
+    """
+
+    model: str
+    dimensions: int
+    max_completion_tokens: int
+    endpoint: str
+    api_key: str
+    mock: bool
+    batch_size: int
+    tokenizer: object
+
+    def __init__(
+        self,
+        model: str | None = "default",
+        dimensions: int = 3072,
+        max_completion_tokens: int | None = None,
+        endpoint: str | None = "http://localhost:8080",
+        api_key: str | None = "no-key-required",
+        batch_size: int = 36,
+        input_type: str | None = None,
+    ):
+        self.model = model or "default"
+        self.dimensions = dimensions
+        self.endpoint = endpoint or "http://localhost:8080"
+        self.api_key = api_key or "no-key-required"
+        self.batch_size = batch_size
+        # Some OpenAI-compatible servers (e.g. self-hosted NVIDIA NIM
+        # containers) require an "input_type" field ("query" / "passage")
+        # that isn't part of the OpenAI embeddings spec. Sent via extra_body
+        # so it has no effect on servers that ignore unknown fields.
+        self.input_type = input_type
+        self.tokenizer = self.get_tokenizer()
+        init_input_limit(self, max_completion_tokens)
+
+        enable_mocking = os.getenv("MOCK_EMBEDDING", "false").lower()
+        self.mock = enable_mocking in ("true", "1", "yes")
+
+        # Normalise the base URL: the openai SDK appends /embeddings automatically,
+        # so we need the URL to end with /v1 (not /v1/embeddings).
+        base = self.endpoint.rstrip("/")
+        if base.endswith("/v1/embeddings"):
+            base = base[: -len("/embeddings")]
+        if not base.endswith("/v1"):
+            base = base + "/v1"
+        self._client = AsyncOpenAI(api_key=self.api_key, base_url=base, timeout=120)
+
+    @observe(as_type="embeddings")
+    @retry(
+        stop=stop_after_delay(128),
+        wait=wait_exponential_jitter(2, 128),
+        # Budget exhaustion is terminal too: this engine talks to any
+        # OpenAI-compatible base URL, a LiteLLM proxy included. It is classified
+        # by predicate rather than by class -- see embeddings/retry_config.py.
+        retry=embedding_retry_condition(
+            EmbeddingContextWindowTooSmallError,
+            EmbeddingCredentialsError,
+            ValueError,
+            asyncio.CancelledError,
+        ),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
+    )
+    async def embed_text(self, text: list[str]) -> list[list[float]]:
+        """
+        Embed a list of text strings into vector representations.
+
+        If the input exceeds the model's context window, the method will recursively
+        split the input and combine the results.
+
+        Parameters:
+        -----------
+
+            - text (List[str]): A list of strings to be embedded.
+
+        Returns:
+        --------
+
+            - List[List[float]]: A list of vectors representing the embedded texts.
+        """
+        original_texts = text if isinstance(text, list) else [text]
+        sanitized_text = sanitize_embedding_text_inputs(original_texts)
+
+        if self.mock:
+            embeddings = [[0.0] * (self.dimensions or 1) for _ in sanitized_text]
+            return handle_embedding_response(original_texts, embeddings, self.dimensions)
+
+        try:
+            create_kwargs = {
+                "model": self.model,
+                "input": sanitized_text,
+                "encoding_format": "float",
+            }
+            if self.input_type:
+                create_kwargs["extra_body"] = {"input_type": self.input_type}
+
+            async with embedding_rate_limiter_context_manager():
+                response = await asyncio.wait_for(
+                    self._client.embeddings.create(**create_kwargs),
+                    timeout=300.0,
+                )
+            embeddings = [item.embedding for item in response.data]
+
+        except Exception as error:
+            # A proxy spend cap is terminal, and none of the branches below can
+            # read it correctly: it is neither a context-window problem nor a
+            # connectivity one. Raise the same actionable 402 the LLM path does.
+            raise_if_budget_exhausted(error)
+
+            error_str = str(error).lower()
+
+            # Handle context window exceeded by splitting input
+            context_error_patterns = (
+                "context length",
+                "context window",
+                "too long",
+                "maximum context",
+                "maximum tokens",
+                "max tokens",
+            )
+            if any(pattern in error_str for pattern in context_error_patterns):
+                if isinstance(original_texts, list) and len(original_texts) > 1:
+                    mid = math.ceil(len(original_texts) / 2)
+                    left_vecs, right_vecs = await asyncio.gather(
+                        self.embed_text(original_texts[:mid]),
+                        self.embed_text(original_texts[mid:]),
+                    )
+                    embeddings = left_vecs + right_vecs
+                    return handle_embedding_response(original_texts, embeddings, self.dimensions)
+
+                if isinstance(original_texts, list) and len(original_texts) == 1:
+                    s = original_texts[0]
+                    third = len(s) // 3
+                    if third == 0:
+                        raise EmbeddingContextWindowTooSmallError from error
+                    left_part, right_part = s[: third * 2], s[third:]
+                    (left_vec,), (right_vec,) = await asyncio.gather(
+                        self.embed_text([left_part]),
+                        self.embed_text([right_part]),
+                    )
+                    pooled = (np.array(left_vec) + np.array(right_vec)) / 2
+                    embeddings = [pooled.tolist()]
+                    return handle_embedding_response(original_texts, embeddings, self.dimensions)
+
+            if isinstance(error, asyncio.TimeoutError):
+                logger.error(
+                    "Embedding endpoint timed out. EMBEDDING_ENDPOINT='%s'.",
+                    self.endpoint,
+                )
+                raise EmbeddingException(
+                    "Embedding request timed out. Check EMBEDDING_ENDPOINT connectivity."
+                ) from error
+
+            if isinstance(error, (httpx.ConnectError, httpx.ReadTimeout)):
+                logger.error(
+                    "Failed to connect to embedding endpoint. EMBEDDING_ENDPOINT='%s'.",
+                    self.endpoint,
+                )
+                raise EmbeddingException(
+                    "Cannot connect to embedding endpoint. Check EMBEDDING_ENDPOINT."
+                ) from error
+
+            if isinstance(error, (openai.AuthenticationError, openai.PermissionDeniedError)):
+                # Terminal credential failures are re-raised as a cognee type,
+                # not as the openai class: the class is what the exclusion list
+                # cannot use (the generic wrap below would hide it from the
+                # predicate anyway), and staying inside CogneeApiError is what
+                # keeps the API's 422 instead of falling through a router's
+                # ``except Exception`` into a 500. Diverges from
+                # LiteLLMEmbeddingEngine, which re-raises litellm's class bare so
+                # the CLI's remediation can match its message; that message shape
+                # is litellm's, not this SDK's, so the rationale does not carry
+                # over. The provider's text is preserved in the message instead.
+                #
+                # NotFoundError is deliberately left retryable here, unlike in
+                # LiteLLMEmbeddingEngine: an ingress or reverse proxy in front of
+                # a self-hosted server can 404 transiently during a rolling
+                # deploy, which is realistic for exactly this engine. The cost is
+                # that a permanent 404 (a typo'd model name, a wrong base path)
+                # still burns the full ladder.
+                logger.error(
+                    "Embedding endpoint rejected the request: %s. EMBEDDING_ENDPOINT='%s'.",
+                    str(error),
+                    self.endpoint,
+                )
+                raise EmbeddingCredentialsError(str(error)) from error
+
+            logger.error(
+                "Error embedding text: %s. EMBEDDING_ENDPOINT='%s'.",
+                str(error),
+                self.endpoint,
+            )
+            raise EmbeddingException(
+                "Embedding failed. Verify EMBEDDING_ENDPOINT and server status."
+            ) from error
+
+        return handle_embedding_response(original_texts, embeddings, self.dimensions)
+
+    def get_vector_size(self) -> int:
+        """
+        Retrieve the size of the embedding vectors.
+
+        Returns:
+        --------
+
+            - int: The dimension of the embedding vectors.
+        """
+        return self.dimensions
+
+    def get_batch_size(self) -> int:
+        """
+        Return the desired batch size for embedding calls.
+
+        Returns:
+        --------
+
+            - int: The batch size.
+        """
+        return self.batch_size
+
+    input_limit_source = "litellm model table or the model's tokenizer"
+
+    async def input_limit(self) -> int | None:
+        """A self-hosted server names no limit; the served model id is usually a
+        HuggingFace repo (its tokenizer knows) or a hosted model litellm knows."""
+        return litellm_input_limit(self.model) or sane_limit(self.tokenizer.model_input_limit)
+
+    def get_tokenizer(self):
+        """Load a tokenizer for chunk sizing against OpenAI-compatible embedding servers.
+
+        The served model id is usually a HuggingFace repo, so resolution uses the
+        model's own tokenizer and warns/falls back safely on mismatch (issue #3646).
+        """
+        logger.debug("Loading tokenizer for OpenAICompatibleEmbeddingEngine...")
+        return resolve_embedding_tokenizer(provider="openai_compatible", model=self.model)

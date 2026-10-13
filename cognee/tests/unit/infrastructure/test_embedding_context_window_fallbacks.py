@@ -1,0 +1,269 @@
+from unittest.mock import AsyncMock, Mock, patch
+
+import numpy as np
+import pytest
+
+from cognee.infrastructure.databases.exceptions import (
+    EmbeddingContextWindowTooSmallError,
+    EmbeddingException,
+)
+
+
+@pytest.mark.asyncio
+async def test_ollama_embedding_splits_batch_on_context_window_error():
+    with patch(
+        "cognee.infrastructure.databases.vector.embeddings.OllamaEmbeddingEngine."
+        "OllamaEmbeddingEngine.get_tokenizer",
+        return_value=Mock(),
+    ):
+        from cognee.infrastructure.databases.vector.embeddings.OllamaEmbeddingEngine import (
+            OllamaEmbeddingEngine,
+        )
+
+        engine = OllamaEmbeddingEngine(model="test-model", dimensions=2)
+
+    async def fake_get_embedding(prompt):
+        if prompt == "too long":
+            raise ValueError("input length exceeds context length")
+        # "too long" (8 chars) splits into third=8//3=2 → left="too " (s[:4]), right="o long" (s[2:])
+        mapping = {
+            "too ": [1.0, 1.0],
+            "o long": [2.0, 2.0],
+            "ok 1": [1.0, 1.0],
+            "ok 2": [2.0, 2.0],
+        }
+        return mapping[prompt]
+
+    with patch.object(engine, "_get_embedding", side_effect=fake_get_embedding):
+        result = await engine.embed_text(["too long", "ok 1", "ok 2"])
+
+    # "too long" → pooled([1.0,1.0], [2.0,2.0]) = [1.5,1.5]; others pass through
+    assert result == [[1.5, 1.5], [1.0, 1.0], [2.0, 2.0]]
+
+
+@pytest.mark.asyncio
+async def test_ollama_embedding_raises_when_short_text_still_exceeds_context_window():
+    with patch(
+        "cognee.infrastructure.databases.vector.embeddings.OllamaEmbeddingEngine."
+        "OllamaEmbeddingEngine.get_tokenizer",
+        return_value=Mock(),
+    ):
+        from cognee.infrastructure.databases.vector.embeddings.OllamaEmbeddingEngine import (
+            OllamaEmbeddingEngine,
+        )
+
+        engine = OllamaEmbeddingEngine(model="test-model", dimensions=2)
+
+    async def always_fail(_prompt):
+        raise ValueError("maximum context length exceeded")
+
+    with (
+        patch.object(engine, "_get_embedding", side_effect=always_fail),
+        pytest.raises(EmbeddingException, match="too short to split further"),
+    ):
+        await engine.embed_text(["ab"])
+
+
+@pytest.mark.asyncio
+async def test_fastembed_splits_batch_on_context_window_error():
+    pytest.importorskip("fastembed")
+
+    with (
+        patch(
+            "cognee.infrastructure.databases.vector.embeddings.FastembedEmbeddingEngine."
+            "FastembedEmbeddingEngine.get_tokenizer",
+            return_value=Mock(),
+        ),
+        patch(
+            "cognee.infrastructure.databases.vector.embeddings.FastembedEmbeddingEngine."
+            "TextEmbedding",
+        ) as mock_text_embedding,
+    ):
+        embedding_model = Mock()
+        mock_text_embedding.return_value = embedding_model
+
+        def fake_embed(inputs, batch_size, parallel):
+            if inputs == ["too long", "ok 1", "ok 2"]:
+                raise RuntimeError("input length exceeds context window")
+            if inputs == ["too long", "ok 1"]:
+                raise RuntimeError("maximum tokens exceeded")
+            if inputs == ["too long"]:
+                raise RuntimeError("context length exceeded")
+            # "too long" (8 chars) splits into third=8//3=2 → left="too " (s[:4]), right="o long" (s[2:])
+            if inputs == ["too "]:
+                return iter([np.array([1.0, 1.0])])
+            if inputs == ["o long"]:
+                return iter([np.array([2.0, 2.0])])
+            if inputs == ["ok 1"]:
+                return iter([np.array([3.0, 3.0])])
+            if inputs == ["ok 2"]:
+                return iter([np.array([4.0, 4.0])])
+            raise AssertionError(f"Unexpected inputs: {inputs}")
+
+        embedding_model.embed.side_effect = fake_embed
+
+        from cognee.infrastructure.databases.vector.embeddings.FastembedEmbeddingEngine import (
+            FastembedEmbeddingEngine,
+        )
+
+        engine = FastembedEmbeddingEngine(model="test-model", dimensions=2)
+        result = await engine.embed_text(["too long", "ok 1", "ok 2"])
+
+    assert result == [[1.5, 1.5], [3.0, 3.0], [4.0, 4.0]]
+
+
+@pytest.mark.asyncio
+async def test_fastembed_raises_when_short_text_still_exceeds_context_window():
+    pytest.importorskip("fastembed")
+
+    with (
+        patch(
+            "cognee.infrastructure.databases.vector.embeddings.FastembedEmbeddingEngine."
+            "FastembedEmbeddingEngine.get_tokenizer",
+            return_value=Mock(),
+        ),
+        patch(
+            "cognee.infrastructure.databases.vector.embeddings.FastembedEmbeddingEngine."
+            "TextEmbedding",
+        ) as mock_text_embedding,
+    ):
+        embedding_model = Mock()
+        embedding_model.embed.side_effect = RuntimeError("context window exceeded")
+        mock_text_embedding.return_value = embedding_model
+
+        from cognee.infrastructure.databases.vector.embeddings.FastembedEmbeddingEngine import (
+            FastembedEmbeddingEngine,
+        )
+
+        engine = FastembedEmbeddingEngine(model="test-model", dimensions=2)
+
+        with pytest.raises(EmbeddingException, match="too short to split further"):
+            await engine.embed_text(["ab"])
+
+        assert embedding_model.embed.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_litellm_embedding_does_not_retry_unsplittable_context_window_error():
+    import litellm
+
+    with patch(
+        "cognee.infrastructure.databases.vector.embeddings.LiteLLMEmbeddingEngine."
+        "LiteLLMEmbeddingEngine.get_tokenizer",
+        return_value=Mock(),
+    ):
+        from cognee.infrastructure.databases.vector.embeddings.LiteLLMEmbeddingEngine import (
+            LiteLLMEmbeddingEngine,
+        )
+
+        engine = LiteLLMEmbeddingEngine(model="test-model", dimensions=2)
+
+    context_error = litellm.exceptions.BadRequestError(
+        message="maximum input length exceeded",
+        model="test-model",
+        llm_provider="openai",
+    )
+
+    with patch("litellm.aembedding", AsyncMock(side_effect=context_error)) as embed_mock:
+        with pytest.raises(EmbeddingContextWindowTooSmallError):
+            await engine.embed_text(["ab"])
+
+        assert embed_mock.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_embedding_does_not_retry_unsplittable_context_window_error():
+    with patch(
+        "cognee.infrastructure.databases.vector.embeddings.OpenAICompatibleEmbeddingEngine."
+        "OpenAICompatibleEmbeddingEngine.get_tokenizer",
+        return_value=Mock(),
+    ):
+        from cognee.infrastructure.databases.vector.embeddings.OpenAICompatibleEmbeddingEngine import (
+            OpenAICompatibleEmbeddingEngine,
+        )
+
+        engine = OpenAICompatibleEmbeddingEngine(model="test-model", dimensions=2)
+
+    create_mock = AsyncMock(side_effect=RuntimeError("context window exceeded"))
+    engine._client.embeddings.create = create_mock
+
+    with pytest.raises(EmbeddingContextWindowTooSmallError):
+        await engine.embed_text(["ab"])
+
+    assert create_mock.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_litellm_embedding_splits_batch_on_vertex_instance_limit_error():
+    import litellm
+
+    with patch(
+        "cognee.infrastructure.databases.vector.embeddings.LiteLLMEmbeddingEngine."
+        "LiteLLMEmbeddingEngine.get_tokenizer",
+        return_value=Mock(),
+    ):
+        from cognee.infrastructure.databases.vector.embeddings.LiteLLMEmbeddingEngine import (
+            LiteLLMEmbeddingEngine,
+        )
+
+        engine = LiteLLMEmbeddingEngine(model="test-model", dimensions=2)
+
+    instance_limit_error = litellm.exceptions.BadRequestError(
+        message="2 instance(s) is allowed per prediction. Actual: 4",
+        model="test-model",
+        llm_provider="vertex_ai",
+    )
+
+    async def fake_aembedding(**kwargs):
+        if len(kwargs["input"]) > 2:
+            raise instance_limit_error
+        return Mock(data=[{"embedding": [1.0, 1.0]} for _ in kwargs["input"]])
+
+    with patch("litellm.aembedding", AsyncMock(side_effect=fake_aembedding)) as embed_mock:
+        result = await engine.embed_text(["a", "b", "c", "d"])
+
+    assert result == [[1.0, 1.0]] * 4
+    assert embed_mock.await_count > 1
+
+
+@pytest.mark.asyncio
+async def test_litellm_embedding_splits_batch_on_vertex_model_batch_limit_error():
+    import litellm
+
+    with patch(
+        "cognee.infrastructure.databases.vector.embeddings.LiteLLMEmbeddingEngine."
+        "LiteLLMEmbeddingEngine.get_tokenizer",
+        return_value=Mock(),
+    ):
+        from cognee.infrastructure.databases.vector.embeddings.LiteLLMEmbeddingEngine import (
+            LiteLLMEmbeddingEngine,
+        )
+
+        engine = LiteLLMEmbeddingEngine(model="test-model", dimensions=2)
+
+    # Verbatim phrasing of Vertex's per-model batch cap (distinct from the
+    # per-prediction instance cap covered above): once a request is under the
+    # 2048-instance prediction limit, Vertex enforces a much smaller
+    # per-model batchSize cap (e.g. 250 for gemini-embedding-001).
+    batch_limit_error = litellm.exceptions.BadRequestError(
+        message=(
+            "Unable to submit request because it included too many instances. "
+            "Reduce the number of instances and try again. "
+            "Unable to submit request because it has a batchSize value of 1234 "
+            "but the supported range is from 1 (inclusive) to 251 (exclusive). "
+            "Update the value and try again."
+        ),
+        model="test-model",
+        llm_provider="vertex_ai",
+    )
+
+    async def fake_aembedding(**kwargs):
+        if len(kwargs["input"]) > 2:
+            raise batch_limit_error
+        return Mock(data=[{"embedding": [1.0, 1.0]} for _ in kwargs["input"]])
+
+    with patch("litellm.aembedding", AsyncMock(side_effect=fake_aembedding)) as embed_mock:
+        result = await engine.embed_text(["a", "b", "c", "d"])
+
+    assert result == [[1.0, 1.0]] * 4
+    assert embed_mock.await_count > 1

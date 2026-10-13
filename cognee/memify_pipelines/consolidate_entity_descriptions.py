@@ -1,0 +1,132 @@
+"""Memify pipeline that rewrites Entity descriptions and EntityType summaries.
+
+Mirrors the structure of the sibling graph-mutating enrichment pipelines (e.g.
+``consolidate_entities``): a thin wrapper that builds the extraction +
+enrichment tasks and hands them to ``memify``. Dataset auth and the
+per-dataset database context stay inside ``memify`` / ``run_pipeline`` — do
+not wrap this call in ``set_database_global_context_variables`` (SDK-483).
+The actual work lives in ``cognee.tasks.memify.consolidate_entity_descriptions``.
+"""
+
+from cognee import memify
+from cognee.modules.data.constants import DEFAULT_DATASET_NAME
+from cognee.modules.pipelines.tasks.task import Task
+from cognee.modules.users.models import User
+from cognee.shared.logging_utils import get_logger
+from cognee.tasks.memify.consolidate_entity_descriptions import (
+    generate_consolidated_entities,
+    generate_type_descriptions,
+    get_entities_with_neighborhood,
+)
+from cognee.tasks.memify.consolidate_entity_descriptions.constants import (
+    MAX_CONCURRENT_ENTITY_LLM_CALLS,
+    MAX_CONCURRENT_TYPE_LLM_CALLS,
+    MAX_MEMBERS_PER_TYPE_PROMPT,
+    MAX_NAMED_MEMBERS,
+    MAX_NEIGHBOR_LINES_IN_PROMPT,
+    MAX_NEIGHBOR_TEXT_CHARS,
+    MAX_PERSISTED_IS_A_CHARS,
+    PARAGRAPH_MAX_COMPLETION_TOKENS,
+    TOKENS_PER_IS_A_LINE,
+)
+from cognee.tasks.storage import add_data_points
+
+logger = get_logger("consolidate_entity_descriptions_pipeline")
+
+
+async def consolidate_entity_descriptions_pipeline(
+    user: User | None = None,
+    dataset: str = DEFAULT_DATASET_NAME,
+    run_in_background: bool = False,
+    entity_max_concurrent_calls: int = MAX_CONCURRENT_ENTITY_LLM_CALLS,
+    entity_max_neighbor_lines: int = MAX_NEIGHBOR_LINES_IN_PROMPT,
+    entity_max_neighbor_text_chars: int = MAX_NEIGHBOR_TEXT_CHARS,
+    entity_description_max_completion_tokens: int = PARAGRAPH_MAX_COMPLETION_TOKENS,
+    type_max_concurrent_calls: int = MAX_CONCURRENT_TYPE_LLM_CALLS,
+    type_max_members_per_batch: int = MAX_MEMBERS_PER_TYPE_PROMPT,
+    type_max_named_members: int = MAX_NAMED_MEMBERS,
+    type_max_persisted_is_a_chars: int = MAX_PERSISTED_IS_A_CHARS,
+    type_description_max_completion_tokens: int = PARAGRAPH_MAX_COMPLETION_TOKENS,
+    type_tokens_per_is_a_line: int = TOKENS_PER_IS_A_LINE,
+):
+    """Rewrite Entity descriptions from their graph neighborhood, then summarize
+    each EntityType from its member Entities and write is_a edge text.
+
+    Every size/budget cap below is a defensive backstop against pathological
+    inputs (an unusually long description, an over-connected entity, a huge
+    type), not a rigorously derived per-model token budget - cognee is
+    model-agnostic, so there's no single number that's "correct" for every
+    deployment. The defaults are reasonable starting points; override them
+    per call site if your data or model needs something different, rather
+    than editing the module constants.
+
+    Args:
+        user: Acting user; forwarded to ``memify`` (default user when omitted).
+        dataset: Dataset name (or id) whose graph to consolidate. Forwarded to
+            ``memify``, which resolves write access and the dataset DB context.
+        run_in_background: Forwarded to ``memify``.
+        entity_max_concurrent_calls: Max concurrent LLM calls while rewriting
+            Entity descriptions (Phase 1).
+        entity_max_neighbor_lines: Max neighborhood lines in one Entity's
+            rewrite prompt. Counted in lines, not neighbors: a neighbor linked
+            by several distinct edges contributes one line per edge.
+        entity_max_neighbor_text_chars: Max characters of text per neighbor
+            shown in that prompt.
+        entity_description_max_completion_tokens: Output token budget for the
+            Entity description call.
+        type_max_concurrent_calls: Max concurrent LLM calls while summarizing
+            EntityTypes (Phase 2/3) - bounds every individual call, not just
+            how many types are processed at once.
+        type_max_members_per_batch: Max members shown in one type-summary
+            prompt before batching + merging kicks in.
+        type_max_named_members: At or below this member count, the type
+            summary names members individually; above it, it doesn't.
+        type_max_persisted_is_a_chars: Max characters of is_a edge text
+            written to the graph, independent of the LLM call's own output
+            budget - that budget caps generation, this caps what is stored.
+            The prompt-side caps (member cards, merge partials) are module
+            constants in constants.py; they bound prompt size rather than
+            anything a caller sees.
+        type_description_max_completion_tokens: Output token budget for the
+            type description and merge calls.
+        type_tokens_per_is_a_line: Output token budget per member for the
+            is_a-only call - that call returns one line per member in the
+            batch, not a single paragraph, so its total budget scales with
+            batch size instead of being fixed.
+
+    Returns:
+        The ``memify`` pipeline result.
+    """
+    extraction_tasks = [Task(get_entities_with_neighborhood)]
+
+    enrichment_tasks = [
+        Task(
+            generate_consolidated_entities,
+            max_concurrent_calls=entity_max_concurrent_calls,
+            max_neighbor_lines=entity_max_neighbor_lines,
+            max_neighbor_text_chars=entity_max_neighbor_text_chars,
+            max_completion_tokens=entity_description_max_completion_tokens,
+        ),
+        Task(
+            generate_type_descriptions,
+            max_concurrent_calls=type_max_concurrent_calls,
+            max_members_per_batch=type_max_members_per_batch,
+            max_named_members=type_max_named_members,
+            max_persisted_is_a_chars=type_max_persisted_is_a_chars,
+            max_completion_tokens=type_description_max_completion_tokens,
+            tokens_per_is_a_line=type_tokens_per_is_a_line,
+        ),
+        Task(add_data_points),
+    ]
+
+    result = await memify(
+        extraction_tasks=extraction_tasks,
+        enrichment_tasks=enrichment_tasks,
+        data=[{}],  # A placeholder to prevent fetching the entire graph
+        dataset=dataset,
+        user=user,
+        run_in_background=run_in_background,
+    )
+
+    logger.info("consolidate_entity_descriptions pipeline finished (dataset=%s).", dataset)
+    return result

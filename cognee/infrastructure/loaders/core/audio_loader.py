@@ -1,0 +1,105 @@
+import os
+from typing import Any
+
+from cognee.infrastructure.files.storage import get_file_storage, get_storage_config
+from cognee.infrastructure.files.utils.get_file_metadata import get_file_metadata
+from cognee.infrastructure.llm.LLMGateway import LLMGateway
+from cognee.infrastructure.loaders.LoaderInterface import LoaderInterface, LoaderResult
+from cognee.infrastructure.loaders.store_derived_text import store_derived_text
+from cognee.infrastructure.loaders.utils.require_llm import require_llm_for_media
+
+
+class AudioLoader(LoaderInterface):
+    """
+    Core text file loader that handles basic text file formats.
+
+    This loader is always available and serves as the fallback for
+    text-based files when no specialized loader is available.
+    """
+
+    loader_name = "audio_loader"
+
+    @property
+    def supported_extensions(self) -> list[str]:
+        """Supported text file extensions."""
+        return [
+            "aac",  # Audio documents
+            "mid",
+            "mp3",
+            "m4a",
+            "ogg",
+            "flac",
+            "wav",
+            "amr",
+            "aiff",
+        ]
+
+    @property
+    def supported_mime_types(self) -> list[str]:
+        """Supported MIME types for text content."""
+        return [
+            "audio/aac",
+            "audio/midi",
+            "audio/mpeg",
+            "audio/mp4",
+            "audio/ogg",
+            "audio/flac",
+            "audio/wav",
+            "audio/amr",
+            "audio/aiff",
+            "audio/x-wav",
+        ]
+
+    def can_handle(self, extension: str, mime_type: str) -> bool:
+        """
+        Check if this loader can handle the given file.
+
+        Args:
+            extension: File extension
+            mime_type: Optional MIME type
+
+        Returns:
+            True if file can be handled, False otherwise
+        """
+        return bool(
+            extension in self.supported_extensions and mime_type in self.supported_mime_types
+        )
+
+    async def load(self, file_path: str, **kwargs: Any) -> "str | LoaderResult":
+        """
+        Load and process the audio file.
+
+        Args:
+            file_path: Path to the file to load
+            **kwargs: Additional configuration (unused)
+
+        Returns:
+            LoaderResult containing the file content and metadata
+
+        Raises:
+            FileNotFoundError: If file doesn't exist
+            OSError: If file cannot be read
+        """
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        require_llm_for_media("Audio", "cognee transcribes audio with the LLM before indexing it")
+
+        with open(file_path, "rb") as f:
+            file_metadata = await get_file_metadata(f)
+        # Name ingested file of current loader based on original file content hash
+        storage_file_name = "text_" + file_metadata["content_hash"] + ".txt"
+
+        result = await LLMGateway.create_transcript(file_path)
+
+        if result is None:
+            return ""
+
+        if not kwargs.get("persist", True):
+            return result.text
+
+        storage_config = get_storage_config()
+        data_root_directory = storage_config["data_root_directory"]
+        storage = get_file_storage(data_root_directory)
+
+        return await store_derived_text(storage, storage_file_name, result.text)

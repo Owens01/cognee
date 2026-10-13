@@ -1,0 +1,224 @@
+"""Discriminated-union memory entries for remember()/recall().
+
+Typed payloads let callers pass rich structured data to
+``cognee.remember()`` — Q&A turns, agent trace steps, feedback
+attachments, and skill-run scores — in addition to the legacy
+"blob of text/files" shape.
+Each entry carries a literal ``type`` discriminator so the remember
+dispatch can route to the right ``SessionManager`` method.
+
+Raw data (str / bytes / file-like / list of the above) continues to
+flow through the permanent add+cognify path unchanged.
+"""
+
+from typing import Any, Literal
+from uuid import uuid4
+
+from pydantic import BaseModel, Field, field_validator
+
+from cognee.shared.logging_utils import get_logger
+
+logger = get_logger("memory.entries")
+
+
+class QAEntry(BaseModel):
+    """A Q&A turn stored in the session cache.
+
+    Represents a user question + assistant answer with optional
+    retrieval context. Dispatched to ``SessionManager.add_qa``.
+    """
+
+    type: Literal["qa"] = "qa"
+    question: str = Field(examples=["What is the capital of France?"])
+    answer: str = Field(examples=["The capital of France is Paris."])
+    context: str = Field(default="", examples=["Retrieved from geography_notes.md"])
+    feedback_text: str | None = None
+    feedback_score: int | None = None
+    used_graph_element_ids: dict | None = None
+
+
+class TraceEntry(BaseModel):
+    """One step of an agent trace.
+
+    Structured representation of a tool/function call — origin,
+    outcome, parameters, return value. Dispatched to
+    ``SessionManager.add_agent_trace_step``.
+    """
+
+    type: Literal["trace"] = "trace"
+    origin_function: str = Field(
+        examples=["search_codebase"],
+        description="Name of the tool/function whose execution this trace step records.",
+    )
+    status: Literal["success", "error"] = "success"
+    method_params: dict | None = None
+    method_return_value: Any | None = None
+    memory_query: str = ""
+    memory_context: str = ""
+    error_message: str = ""
+    generate_feedback_with_llm: bool = False
+
+
+class FeedbackEntry(BaseModel):
+    """Feedback attached to an existing QA entry.
+
+    Semantically an update rather than a new memory — carried through
+    remember() for API minimalism. Dispatched to
+    ``SessionManager.add_feedback``.
+    """
+
+    type: Literal["feedback"] = "feedback"
+    qa_id: str = Field(
+        examples=["c4d5e6f7-8a9b-4c0d-9e1f-2a3b4c5d6e7f"],
+        description=(
+            "entry_id returned by a previous qa remember call — use it to chain "
+            "feedback to that QA."
+        ),
+    )
+    feedback_text: str | None = None
+    feedback_score: int | None = None
+
+
+class SkillRunEntry(BaseModel):
+    """A persisted execution record for a skill.
+
+    This is graph-backed rather than session-cache-backed. It lets agents
+    report explicit skill quality signals through ``cognee.remember()``
+    without adding another public API surface.
+    """
+
+    type: Literal["skill_run"] = "skill_run"
+    run_id: str = Field(default_factory=lambda: str(uuid4()))
+    selected_skill_id: str
+    task_text: str = ""
+    result_summary: str = ""
+    success_score: float | None = None
+    feedback: float = 0.0
+    error_type: str = ""
+    error_message: str = ""
+    started_at_ms: int = 0
+    latency_ms: int = 0
+    candidate_skill_ids: list[str] = Field(default_factory=list)
+    task_pattern_id: str = ""
+    router_version: str = ""
+    tool_trace: list[dict[str, Any]] = Field(default_factory=list)
+    node_set: str = "skills"
+
+    @field_validator("success_score")
+    @classmethod
+    def _validate_success_score(cls, value: float | None) -> float | None:
+        if value is not None and not 0.0 <= value <= 1.0:
+            raise ValueError("success_score must be in range [0.0, 1.0]")
+        return value
+
+    @field_validator("feedback")
+    @classmethod
+    def _validate_feedback(cls, value: float) -> float:
+        if not -1.0 <= value <= 1.0:
+            raise ValueError("feedback must be in range [-1.0, 1.0]")
+        return value
+
+    @field_validator("started_at_ms", "latency_ms")
+    @classmethod
+    def _validate_non_negative_ms(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("timestamp and latency fields must be non-negative")
+        return value
+
+
+MemoryEntry = QAEntry | TraceEntry | FeedbackEntry | SkillRunEntry
+
+
+# Tuple used at runtime for isinstance checks; Union itself isn't
+# a valid isinstance target on older Python versions.
+MEMORY_ENTRY_TYPES = (QAEntry, TraceEntry, FeedbackEntry, SkillRunEntry)
+
+
+RecallScope = Literal[
+    "auto",
+    "graph",
+    "session",
+    "session_first",
+    "trace",
+    "graph_context",
+    "session_context",
+    "all",
+    "tools",
+    "code",
+]
+
+
+_DEPRECATED_SCOPE_ALIASES = {"graph_context": "graph"}
+# "tools" is explicit opt-in only: it is valid here but deliberately NOT part
+# of the "all" expansion or the "auto" resolution — recall must never reach an
+# external database unless the caller asked for it by name.
+# "code" is likewise opt-in only: it runs a deterministic code-graph query
+# whose seed is the raw query text, which is only useful when the caller knows
+# the prompt names a code identifier — "auto"/"all" must not pay its snapshot
+# cost (or add noise) on ordinary conversational recalls.
+_VALID_SCOPES = {
+    "auto",
+    "graph",
+    "session",
+    "session_first",
+    "trace",
+    "graph_context",
+    "session_context",
+    "all",
+    "tools",
+    "code",
+}
+
+
+def normalize_scope(scope: str | list[str] | None) -> list[str]:
+    """Normalize the recall ``scope`` parameter to a concrete source list.
+
+    Accepts ``None``, a single string, or a list of strings. Returns a
+    deduplicated list of concrete sources (``graph``, ``session``,
+    ``trace``, ``session_context``). ``None`` and ``"auto"`` expand later
+    based on whether a session_id is present; this function just
+    canonicalizes the input.
+
+    Raises ``ValueError`` on unknown scope names.
+    """
+    if scope is None:
+        return ["auto"]
+    if isinstance(scope, str):
+        scopes = [scope]
+    else:
+        scopes = list(scope)
+
+    unknown = [s for s in scopes if s not in _VALID_SCOPES]
+    if unknown:
+        raise ValueError(
+            f"Unknown recall scope(s): {unknown}. Valid values: {sorted(_VALID_SCOPES)}"
+        )
+
+    if any(s in _DEPRECATED_SCOPE_ALIASES for s in scopes):
+        logger.warning(
+            "Recall scope 'graph_context' is deprecated and now maps to 'graph'. "
+            "Use scope='graph' instead."
+        )
+        scopes = [_DEPRECATED_SCOPE_ALIASES.get(s, s) for s in scopes]
+
+    if "all" in scopes:
+        # "tools" never rides along with "all" — external-database access is
+        # explicit opt-in per call. Preserve it only when the caller combined
+        # it with "all" themselves (e.g. scope=["all", "tools"]).
+        expanded = ["graph", "session", "trace", "session_context"]
+        if "tools" in scopes:
+            expanded.append("tools")
+        # "session_first" is a strategy over sources rather than a source, so
+        # "all" neither implies nor replaces it; carry it through when asked.
+        if "session_first" in scopes:
+            expanded.append("session_first")
+        return expanded
+
+    # Dedupe while preserving order
+    seen: set = set()
+    out: list[str] = []
+    for s in scopes:
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out

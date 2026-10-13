@@ -1,0 +1,427 @@
+from typing import Any
+from uuid import UUID
+
+from cognee.base_config import get_base_config
+from cognee.context_global_variables import set_session_user_context_variable
+from cognee.exceptions import CogneeValidationError
+from cognee.infrastructure.databases.exceptions import DatabaseNotCreatedError
+from cognee.infrastructure.databases.vector.embeddings.config import EmbeddingConfig
+from cognee.infrastructure.llm.config import LLMConfig
+from cognee.modules.data.exceptions import DatasetNotFoundError
+from cognee.modules.data.methods import get_authorized_existing_datasets
+from cognee.modules.engine.models import Skill
+from cognee.modules.engine.models.node_set import NodeSet
+from cognee.modules.observability import (
+    COGNEE_RESULT_COUNT,
+    COGNEE_RESULT_SUMMARY,
+    COGNEE_SEARCH_QUERY,
+    COGNEE_SEARCH_TYPE,
+    MEMORY_OPERATION,
+    MEMORY_QUERY_TEXT,
+    MEMORY_QUERY_TYPE,
+    MEMORY_RESULT_COUNT,
+    MEMORY_SYSTEM,
+    increment_items_retrieved,
+    increment_vector_searches,
+    new_span,
+    record_operation_duration,
+    record_query_results,
+)
+from cognee.modules.operations import record_operation
+from cognee.modules.search.methods import search as search_function
+from cognee.modules.search.types import SearchResult, SearchType
+from cognee.modules.users.exceptions.exceptions import UserNotFoundError
+from cognee.modules.users.methods import get_default_user
+from cognee.modules.users.models import User
+from cognee.shared.logging_utils import get_logger
+
+logger = get_logger()
+
+
+async def search(
+    query_text: str,
+    query_type: SearchType = SearchType.HYBRID_COMPLETION,
+    user: User | None = None,
+    datasets: list[str] | str | None = None,
+    dataset_ids: list[UUID] | UUID | None = None,
+    system_prompt_path: str = "answer_simple_question.txt",
+    system_prompt: str | None = None,
+    top_k: int = 15,
+    node_type: type | None = NodeSet,
+    node_name: list[str] | None = None,
+    node_name_filter_operator: str = "OR",
+    # only_context / verbose inspect retriever-specific shapes. Pin query_type:
+    # unspecified hybrid may defer to GRAPH_COMPLETION, and this return value
+    # does not include the effective type.
+    only_context: bool = False,
+    session_id: str | None = None,
+    wide_search_top_k: int | None = None,
+    triplet_distance_penalty: float | None = None,
+    feedback_influence: float = get_base_config().default_feedback_influence,
+    verbose: bool = False,
+    retriever_specific_config: dict | None = None,
+    neighborhood_depth: int | None = None,
+    neighborhood_seed_top_k: int | None = None,
+    skills: list[str | Skill] | None = None,
+    tools: list[str] | None = None,
+    max_iter: int | None = None,
+    include_references: bool = False,
+    llm_config: LLMConfig | None = None,
+    embedding_config: EmbeddingConfig | None = None,
+    code_query: dict[str, Any] | None = None,
+) -> list[SearchResult]:
+    """
+    Search and query the knowledge graph for insights, information, and connections.
+
+    This is the final step in the Cognee workflow that retrieves information from the
+    processed knowledge graph. It supports multiple search modes optimized for different
+    use cases - from simple fact retrieval to complex reasoning and code analysis.
+
+    Search Prerequisites:
+        - **LLM_API_KEY**: Required for GRAPH_COMPLETION and RAG_COMPLETION search types
+        - **Data Added**: Must have data previously added via `cognee.add()`
+        - **Knowledge Graph Built**: Must have processed data via `cognee.cognify()`
+        - **Dataset Permissions**: User must have 'read' permission on target datasets
+        - **Vector Database**: Must be accessible for semantic search functionality
+
+    Search Types & Use Cases:
+
+        **HYBRID_COMPLETION** (Default):
+            Document passages plus entity neighbourhoods, then LLM completion.
+            Defers to GRAPH_COMPLETION for a custom node_type, node_name with
+            node_type=None, neighborhood_depth, feedback_influence > 0, or a
+            missing chunk collection.
+
+        **GRAPH_COMPLETION**:
+            Natural language Q&A using full graph context and LLM reasoning.
+            Best for: Complex questions, analysis, summaries, insights.
+            Returns: Conversational AI responses with graph-backed context.
+
+        **RAG_COMPLETION**:
+            Traditional RAG using document chunks without graph structure.
+            Best for: Direct document retrieval, specific fact-finding.
+            Returns: LLM responses based on relevant text chunks.
+
+        **CHUNKS**:
+            Raw text segments that match the query semantically.
+            Best for: Finding specific passages, citations, exact content.
+            Returns: Ranked list of relevant text chunks with metadata.
+
+        **SUMMARIES**:
+            Pre-generated summaries of content.
+            Best for: Quick overviews, document abstracts, topic summaries.
+            Returns: Generated content summaries.
+
+        **CODE**:
+            Deterministic indexed queries and graph traversal over an Enola code graph.
+            Best for: Exact fact filtering, symbol exploration, dependency paths,
+            traversal, and reverse impact analysis without an LLM.
+            Returns: Structured facts, nodes, edges, paths, and traversal statistics.
+
+        **CYPHER**:
+            Direct graph database queries using Cypher syntax.
+            Best for: Advanced users, specific graph traversals, debugging.
+            Returns: Raw graph query results.
+
+        **FEELING_LUCKY**:
+            Intelligently selects and runs the most appropriate search type.
+            Best for: General-purpose queries or when you're unsure which search type is best.
+            Returns: The results from the automatically selected search type.
+
+        **CHUNKS_LEXICAL**:
+            Token-based lexical chunk search (BM25-style lexical ranking). Best for: exact-term matching, stopword-aware lookups.
+            Returns: Ranked text chunks (optionally with scores).
+
+    Args:
+        query_text: Your question or search query in natural language.
+            Examples:
+            - "What are the main themes in this research?"
+            - "How do these concepts relate to each other?"
+            - "Find information about machine learning algorithms"
+            - "What functions handle user authentication?"
+
+        query_type: SearchType enum specifying the search mode.
+                   Defaults to HYBRID_COMPLETION.
+
+        user: User context for data access permissions. Uses default if None.
+
+        datasets: Dataset name(s) to search within. Searches all accessible if None.
+            - Single dataset: "research_papers"
+            - Multiple datasets: ["docs", "reports", "analysis"]
+            - None: Search across all user datasets
+
+        dataset_ids: Alternative to datasets - use specific UUID identifiers.
+
+        system_prompt_path: Custom system prompt file for LLM-based search types.
+                          Defaults to "answer_simple_question.txt".
+
+        top_k: Maximum number of results to return (1-N)
+              Higher values provide more comprehensive but potentially noisy results.
+
+        node_type: Filter results to specific entity types (for advanced filtering).
+
+        node_name: Filter results to specific named entities (for targeted search).
+
+        node_name_filter_operator: Operator determining how to filter based on node names.
+                                    Possible values: AND, OR (default is OR, i.e. disjunction)
+
+        session_id: Optional session identifier for caching Q&A interactions. Defaults to 'default_session' if None.
+
+        verbose: If True, returns detailed result information including graph representation (when possible).
+
+        retriever_specific_config: Optional dictionary of additional configuration parameters specific to the retriever being used.
+        code_query: Structured deterministic CODE operation and arguments. Supported
+                    operations are query_facts, explore, traverse, find_path,
+                    impact_analysis, insights (enola explainer findings with their
+                    evidence facts, filterable by source/min_confidence), architecture
+                    (module-level overview with symbol edges rolled up to modules), and
+                    delta (what the last ingestion changed, plus the snapshot receipt).
+                    Add ``"diagram": "mermaid"`` (or ``"dot"``) to any operation to get
+                    the result rendered as diagram source under ``result["diagram"]``;
+                    architecture includes a Mermaid diagram unless ``"diagram": False``.
+        skills: Explicit skill names or Skill objects to load into the agentic retriever.
+        tools: Optional whitelist of tool names available to the agentic retriever.
+        max_iter: Maximum number of agentic tool-call iterations before forcing a final answer.
+
+    Returns:
+        list: Search results in format determined by query_type:
+
+            **GRAPH_COMPLETION/RAG_COMPLETION**:
+                [List of conversational AI response strings]
+
+            **CHUNKS**:
+                [List of relevant text passages with source metadata]
+
+            **SUMMARIES**:
+                [List of generated content summaries]
+
+            **CODE**:
+                [List of structured code information with context]
+
+            **FEELING_LUCKY**:
+                [List of results in the format of the search type that is automatically selected]
+
+
+
+
+
+    Performance & Optimization:
+        - **GRAPH_COMPLETION**: Slower but most intelligent, uses LLM + graph context
+        - **RAG_COMPLETION**: Medium speed, uses LLM + document chunks (no graph traversal)
+        - **CHUNKS**: Fastest, pure vector similarity search without LLM
+        - **SUMMARIES**: Fast, returns pre-computed summaries
+        - **CODE**: Deterministic and model-free; request cost scales with the selected code graph
+        - **FEELING_LUCKY**: Variable speed, uses LLM + search type selection intelligently
+        - **top_k**: Default 15, applied per dataset. HYBRID_COMPLETION gives each lane
+          `min(top_k, 10)`, so values above 10 do not widen it; set the lanes directly with
+          the `chunks_top_k` / `entities_top_k` / `facts_top_k` keys in
+          `retriever_specific_config` (not capped).
+        - **datasets**: Specify datasets to improve speed and relevance
+
+    Next Steps After Search:
+        - Use results for further analysis or application integration
+        - Combine different search types for comprehensive understanding
+        - Export insights for reporting or downstream processing
+        - Iterate with refined queries based on initial results
+
+    Environment Variables:
+        Required for LLM-based search types (GRAPH_COMPLETION, RAG_COMPLETION):
+        - LLM_API_KEY: API key for your LLM provider
+
+        Optional:
+        - LLM_PROVIDER, LLM_MODEL: Configure LLM for search responses
+        - VECTOR_DB_PROVIDER: Must match what was used during cognify
+        - GRAPH_DATABASE_PROVIDER: Must match what was used during cognify
+
+    """
+    if neighborhood_depth is not None and (
+        not isinstance(neighborhood_depth, int) or neighborhood_depth < 1
+    ):
+        raise CogneeValidationError(
+            message="neighborhood_depth must be a positive integer.",
+            name="InvalidNeighborhoodDepth",
+        )
+    if neighborhood_seed_top_k is not None and (
+        not isinstance(neighborhood_seed_top_k, int) or neighborhood_seed_top_k < 1
+    ):
+        raise CogneeValidationError(
+            message="neighborhood_seed_top_k must be a positive integer.",
+            name="InvalidNeighborhoodSeedTopK",
+        )
+    if max_iter is not None and (not isinstance(max_iter, int) or max_iter < 1):
+        raise CogneeValidationError(
+            message="max_iter must be a positive integer.",
+            name="InvalidMaxIter",
+        )
+    if code_query is not None and query_type is not SearchType.CODE:
+        raise CogneeValidationError(
+            message="code_query requires query_type=SearchType.CODE.",
+            name="InvalidCodeSearchConfig",
+        )
+    agentic_overrides = {
+        "skills": skills,
+        "tools": tools,
+        "max_iter": max_iter,
+    }
+
+    # Route to remote instance if connected via serve()
+    from cognee.api.v1.serve.state import get_remote_client
+
+    client = get_remote_client()
+    if client is not None:
+        return await client.search(
+            query_text,
+            search_type=query_type,
+            datasets=datasets,
+            dataset_ids=dataset_ids,
+            system_prompt=system_prompt,
+            top_k=top_k,
+            node_name=node_name,
+            only_context=only_context,
+            verbose=verbose,
+            include_references=include_references,
+            code_query=code_query,
+            **{key: value for key, value in agentic_overrides.items() if value is not None},
+        )
+
+    async with record_operation("search") as operation_context:
+        with new_span("memory.retrieve") as span:
+            span.set_attribute(MEMORY_SYSTEM, "cognee")
+            span.set_attribute(MEMORY_OPERATION, "retrieve")
+            span.set_attribute(MEMORY_QUERY_TEXT, query_text[:500])
+            span.set_attribute(MEMORY_QUERY_TYPE, str(query_type.value))
+            # legacy cognee attributes for backward compat
+            span.set_attribute(COGNEE_SEARCH_QUERY, query_text[:500])
+            span.set_attribute(COGNEE_SEARCH_TYPE, str(query_type.value))
+            span.set_attribute("cognee.search.top_k", top_k)
+            _search_start_ns = __import__("time").monotonic_ns()
+
+            # We use lists from now on for datasets
+            if isinstance(datasets, (UUID, str)):
+                datasets = [datasets]
+
+            if (
+                skills is not None or tools is not None
+            ) and query_type is not SearchType.AGENTIC_COMPLETION:
+                raise CogneeValidationError(
+                    message="skills/tools require query_type=SearchType.AGENTIC_COMPLETION.",
+                    name="InvalidAgenticSearchConfig",
+                )
+
+            allowed_node_name_operators = {"AND", "OR"}
+            normalized_node_name_filter_operator = (node_name_filter_operator or "").strip().upper()
+
+            if normalized_node_name_filter_operator not in allowed_node_name_operators:
+                raise CogneeValidationError(
+                    f"Invalid node_name_filter_operator: {node_name_filter_operator!r}. Must be one of {sorted(allowed_node_name_operators)}."
+                )
+
+            if user is None:
+                try:
+                    user = await get_default_user()
+                except (DatabaseNotCreatedError, UserNotFoundError) as error:
+                    # Provide a clear, actionable message instead of surfacing low-level stacktraces
+                    raise CogneeValidationError(
+                        message=(
+                            "Search prerequisites not met: no database/default user found. "
+                            "Initialize Cognee before searching by:\n"
+                            "• running `await cognee.add(...)` followed by `await cognee.cognify()`."
+                        ),
+                        name="SearchPreconditionError",
+                    ) from error
+
+            operation_context.set_user(user)
+            operation_context.set_session_id(session_id)
+
+            await set_session_user_context_variable(user)
+
+            # Transform string based datasets to UUID - String based datasets can only be found for
+            # current user. Strict: a name that resolves to nothing fails the request instead of
+            # being dropped from the scope, the same contract dataset_ids has always had.
+            if datasets is not None and all(isinstance(dataset, str) for dataset in datasets):
+                datasets = await get_authorized_existing_datasets(
+                    datasets, "read", user, strict=True
+                )
+                datasets = [dataset.id for dataset in datasets]
+                if not datasets:
+                    raise DatasetNotFoundError(message="No datasets found.")
+
+            target_dataset_ids = dataset_ids if dataset_ids else datasets
+            if isinstance(target_dataset_ids, UUID):
+                target_dataset_ids = [target_dataset_ids]
+            if (
+                target_dataset_ids
+                and len(target_dataset_ids) == 1
+                and isinstance(target_dataset_ids[0], UUID)
+            ):
+                operation_context.set_dataset(target_dataset_ids[0])
+
+            if query_type in (SearchType.AGENTIC_COMPLETION, SearchType.SKILLS):
+                active_dataset_refs = dataset_ids if dataset_ids else datasets
+                if isinstance(active_dataset_refs, UUID):
+                    active_dataset_refs = [active_dataset_refs]
+                if not active_dataset_refs or len(active_dataset_refs) != 1:
+                    if query_type is SearchType.AGENTIC_COMPLETION:
+                        raise CogneeValidationError(
+                            message="Agentic skill search requires exactly one explicit dataset.",
+                            name="InvalidAgenticDatasetScope",
+                        )
+                    raise CogneeValidationError(
+                        message="SKILLS search requires exactly one explicit dataset.",
+                        name="InvalidSkillsDatasetScope",
+                    )
+
+            if any(v is not None for v in agentic_overrides.values()):
+                retriever_specific_config = dict(retriever_specific_config or {})
+                for key, value in agentic_overrides.items():
+                    if value is not None:
+                        retriever_specific_config[key] = value
+
+            if code_query is not None:
+                retriever_specific_config = dict(retriever_specific_config or {})
+                retriever_specific_config.update(code_query)
+
+            filtered_search_results = await search_function(
+                query_text=query_text,
+                query_type=query_type,
+                dataset_ids=dataset_ids if dataset_ids else datasets,
+                user=user,
+                system_prompt_path=system_prompt_path,
+                system_prompt=system_prompt,
+                top_k=top_k,
+                node_type=node_type,
+                node_name=node_name,
+                node_name_filter_operator=normalized_node_name_filter_operator,
+                only_context=only_context,
+                session_id=session_id,
+                wide_search_top_k=wide_search_top_k,
+                triplet_distance_penalty=triplet_distance_penalty,
+                feedback_influence=feedback_influence,
+                verbose=verbose,
+                retriever_specific_config=retriever_specific_config,
+                neighborhood_depth=neighborhood_depth,
+                neighborhood_seed_top_k=neighborhood_seed_top_k,
+                include_references=include_references,
+                llm_config=llm_config,
+                embedding_config=embedding_config,
+            )
+
+            n = len(filtered_search_results) if filtered_search_results else 0
+            span.set_attribute(COGNEE_RESULT_COUNT, n)
+            span.set_attribute(MEMORY_RESULT_COUNT, n)
+            span.set_attribute(
+                COGNEE_RESULT_SUMMARY,
+                f"Found {n} result(s) via {query_type.value}",
+            )
+            _duration_ms = (__import__("time").monotonic_ns() - _search_start_ns) / 1_000_000
+            _attrs = {
+                "memory.system": "cognee",
+                "memory.operation": "retrieve",
+                "memory.query.type": str(query_type.value),
+            }
+            record_operation_duration(_duration_ms, _attrs)
+            record_query_results(n, _attrs)
+            increment_items_retrieved(n, _attrs)
+            increment_vector_searches(_attrs)
+
+            return filtered_search_results

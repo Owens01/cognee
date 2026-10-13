@@ -1,0 +1,92 @@
+from typing import Any
+from uuid import UUID
+
+from cognee.modules.data.constants import DEFAULT_DATASET_NAME
+from cognee.modules.pipelines import run_pipeline
+from cognee.modules.pipelines.layers.pipeline_execution_mode import get_pipeline_executor
+from cognee.modules.pipelines.tasks.task import Task
+from cognee.modules.users.models import User
+from cognee.shared.logging_utils import get_logger
+
+logger = get_logger()
+
+
+async def run_custom_pipeline(
+    tasks: list[Task] | list[str] | None = None,
+    data: Any = None,
+    dataset: str | UUID = DEFAULT_DATASET_NAME,
+    user: User = None,
+    vector_db_config: dict | None = None,
+    graph_db_config: dict | None = None,
+    incremental_loading: bool = False,
+    data_per_batch: int = 20,
+    run_in_background: bool = False,
+    pipeline_name: str = "custom_pipeline",
+    data_cache: bool = False,
+    skip_connection_test: bool = False,
+):
+    """
+    Custom pipeline in Cognee, can work with already built graphs. Data needs to be provided which can be processed
+    with provided tasks.
+
+    Provided tasks and data will be arranged to run the Cognee pipeline and execute graph enrichment/creation.
+
+    This is the core processing step in Cognee that converts raw text and documents
+    into an intelligent knowledge graph. It analyzes content, extracts entities and
+    relationships, and creates semantic connections for enhanced search and reasoning.
+
+    Args:
+        tasks: List of Cognee Tasks to execute.
+        data: The data to ingest. Can be anything when custom extraction and enrichment tasks are used.
+              Data provided here will be forwarded to the first extraction task in the pipeline as input.
+        dataset: Dataset name or dataset uuid to process.
+        user: User context for authentication and data access. Uses default if None.
+        vector_db_config: Custom vector database configuration for embeddings storage.
+        graph_db_config: Custom graph database configuration for relationship storage.
+        incremental_loading: If True, only new or modified data will be processed to avoid duplication. (Only works if data is used with the Cognee python Data model).
+                            The incremental system stores and compares hashes of processed data in the Data model and skips data with the same content hash.
+        data_cache: If True, only new or modified data will be processed to avoid duplication. (Only works if data is used with the Cognee python Data model).
+                            The data cache stores and compares hashes of processed data in the Data model and skips data with the same content hash.
+        data_per_batch: Number of data items to be processed in parallel.
+        run_in_background: If True, starts processing asynchronously and returns immediately.
+                          If False, waits for completion before returning.
+                          Background mode recommended for large datasets (>100MB).
+                          Use pipeline_run_id from return value to monitor progress.
+        skip_connection_test: If True, skip the first-run LLM/embedding connection checks
+                          for this pipeline. Use for pipelines whose tasks perform no LLM
+                          or embedding calls (e.g. the deterministic code graph pipeline).
+                          Pipelines that skip only the LLM probe need no flag: when every
+                          task in the list declares needs_llm=False (e.g. the GLiNER list
+                          from get_gliner_demo_tasks), run_pipeline derives it and probes only
+                          embeddings.
+        pipeline_name: Name recorded on the pipeline run. Graph-writing
+                          pipelines should keep a name listed in
+                          cognee.modules.improve.graph_changes.WRITE_PIPELINE_NAMES
+                          (the default "custom_pipeline" is): improve()'s
+                          enrichment gate counts only those names as graph
+                          changes, so writes under a bespoke name can be
+                          reported as already enriched.
+    """
+
+    custom_tasks = [
+        *tasks,
+    ]
+
+    # By calling get pipeline executor we get a function that will have the run_pipeline run in the background or a function that we will need to wait for
+    pipeline_executor_func = get_pipeline_executor(run_in_background=run_in_background)
+
+    # Run the run_pipeline in the background or blocking based on executor
+    return await pipeline_executor_func(
+        pipeline=run_pipeline,
+        tasks=custom_tasks,
+        user=user,
+        data=data,
+        datasets=dataset,
+        vector_db_config=vector_db_config,
+        graph_db_config=graph_db_config,
+        incremental_loading=incremental_loading,
+        data_per_batch=data_per_batch,
+        pipeline_name=pipeline_name,
+        data_cache=data_cache,
+        skip_connection_test=skip_connection_test,
+    )

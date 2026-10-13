@@ -1,0 +1,300 @@
+"""Adapter for a generic OpenAI-compatible API backend used for Ollama models.
+
+``import asyncio`` below has no direct caller in this module's own body, but it
+is load-bearing: ``test_ollama_adapter.py`` patches ``asyncio.to_thread`` by
+name on this module's namespace, which requires ``asyncio`` to be importable
+here regardless of whether this file calls it. ``F401`` is ignored repo-wide,
+so nothing else would catch its removal; do not delete it as dead code.
+"""
+
+import asyncio
+import base64
+import logging
+from typing import Any
+
+import instructor
+from openai import AsyncOpenAI
+from pydantic import BaseModel
+from tenacity import (
+    before_sleep_log,
+    retry,
+    stop_after_attempt,
+    wait_exponential_jitter,
+)
+
+from cognee.infrastructure.files.utils.open_data_file import open_data_file
+from cognee.infrastructure.llm.exceptions import raise_if_budget_exhausted
+from cognee.infrastructure.llm.retry_config import (
+    llm_retry_condition,
+    llm_retry_stop_condition,
+)
+from cognee.infrastructure.llm.structured_output_framework.litellm_instructor.llm.instructor_modes import (
+    get_instructor_mode,
+)
+from cognee.infrastructure.llm.structured_output_framework.litellm_instructor.llm.llm_interface import (
+    LLMInterface,
+)
+from cognee.infrastructure.llm.structured_output_framework.litellm_instructor.llm.types import (
+    TranscriptionReturnType,
+)
+from cognee.modules.observability.get_observe import get_observe
+from cognee.shared.logging_utils import get_logger
+from cognee.shared.rate_limiting import llm_rate_limiter_context_manager
+
+logger = get_logger()
+
+observe = get_observe()
+
+
+class OllamaAPIAdapter(LLMInterface):
+    """
+    Adapter for a Generic API LLM provider using instructor with an OpenAI backend.
+
+    Public methods:
+
+    - acreate_structured_output
+    - create_transcript
+    - transcribe_image
+
+    Instance variables:
+
+    - name
+    - model
+    - api_key
+    - endpoint
+    - max_completion_tokens
+    - aclient
+    """
+
+    default_instructor_mode = get_instructor_mode("ollama")
+
+    def __init__(
+        self,
+        endpoint: str,
+        api_key: str,
+        model: str,
+        name: str,
+        max_completion_tokens: int,
+        instructor_mode: str | None = None,
+        llm_args: dict[str, Any] | None = None,
+        ollama_num_ctx: int | None = None,
+        transcription_model: str | None = None,
+        image_transcribe_model: str | None = None,
+    ) -> None:
+        self.name = name
+        self.model = model.removeprefix("ollama/") if model.startswith("ollama/") else model
+        self.api_key = api_key
+        self.endpoint = endpoint
+        self.max_completion_tokens = max_completion_tokens
+        self.llm_args: dict[str, Any] = llm_args or {}
+        self.ollama_num_ctx = ollama_num_ctx
+        # Audio goes to the OpenAI-compatible /audio/transcriptions route, which
+        # never accepts a chat model, so an unset value keeps the historical
+        # whisper-1 rather than falling back to the chat model.
+        self.transcription_model = (
+            transcription_model.removeprefix("ollama/") if transcription_model else "whisper-1"
+        )
+        # Ollama ships vision as separate models (llava, llama3.2-vision), so the
+        # chat model is routinely text-only; IMAGE_TRANSCRIBE_MODEL points images
+        # at a multimodal one without changing the chat model.
+        self.image_transcribe_model = (
+            image_transcribe_model.removeprefix("ollama/") if image_transcribe_model else self.model
+        )
+
+        self.instructor_mode = instructor_mode if instructor_mode else self.default_instructor_mode
+
+        # Async client (native async I/O — no sync-call-in-event-loop blocking).
+        # ``self.client`` is the raw client for plain-text/transcription calls;
+        # ``self.aclient`` adds instructor's structured-output layer on top.
+        self.client = AsyncOpenAI(base_url=self.endpoint, api_key=self.api_key)
+        self.aclient = instructor.from_openai(
+            self.client,
+            mode=instructor.Mode(self.instructor_mode),
+        )
+
+    @observe(as_type="generation")
+    @retry(
+        stop=llm_retry_stop_condition,
+        wait=wait_exponential_jitter(8, 128),
+        retry=llm_retry_condition,
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
+    )
+    async def acreate_structured_output(
+        self, text_input: str, system_prompt: str, response_model: type[BaseModel], **kwargs
+    ) -> BaseModel:
+        """
+        Generate a structured output from the LLM using the provided text and system prompt.
+
+        This asynchronous method sends a request to the API with the user's input and the system
+        prompt, and returns a structured response based on the specified model.
+
+        Parameters:
+        -----------
+
+            - text_input (str): The input text provided by the user.
+            - system_prompt (str): The system prompt that guides the response generation.
+            - response_model (Type[BaseModel]): The model type that the response should conform
+              to.
+
+        Returns:
+        --------
+
+            - BaseModel: A structured output that conforms to the specified response model.
+        """
+        merged_kwargs = {**self.llm_args, **kwargs}
+
+        if self.ollama_num_ctx is not None:
+            extra_body = merged_kwargs.get("extra_body", {}) or {}
+            if "num_ctx" not in extra_body:
+                merged_kwargs["extra_body"] = {**extra_body, "num_ctx": self.ollama_num_ctx}
+
+        # A plain string needs no schema — skip instructor and hit the OpenAI-
+        # compatible endpoint directly. Instructor's JSON/tool-call schemas cause
+        # parse failures and retry storms on local llama.cpp-compatible servers.
+        if response_model is str:
+            async with llm_rate_limiter_context_manager():
+                response = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": text_input},
+                    ],
+                    **merged_kwargs,
+                )
+            return response.choices[0].message.content or ""
+
+        try:
+            async with llm_rate_limiter_context_manager():
+                response = await self.aclient.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": system_prompt,
+                        },
+                        {
+                            "role": "user",
+                            "content": f"{text_input}",
+                        },
+                    ],
+                    max_retries=2,
+                    response_model=response_model,
+                    **merged_kwargs,
+                )
+
+            return response
+        except Exception as e:
+            # Same detail-carrying message as the other adapters.
+            raise_if_budget_exhausted(e)
+            raise
+
+    @observe(as_type="transcription")
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential_jitter(8, 128),
+        retry=llm_retry_condition,
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
+    )
+    async def create_transcript(self, input: str, **kwargs: Any) -> TranscriptionReturnType:
+        """
+        Generate an audio transcript from a user query.
+
+        This synchronous method takes an input audio file and returns its transcription. Raises
+        a FileNotFoundError if the input file does not exist, and raises a ValueError if
+        transcription fails or returns no text.
+
+        Parameters:
+        -----------
+
+            - input (str): The path to the audio file to be transcribed.
+
+        Returns:
+        --------
+
+            - str: The transcription of the audio as a string.
+        """
+
+        async with open_data_file(input, mode="rb") as audio_file:
+            transcription = await self.client.audio.transcriptions.create(
+                model=self.transcription_model,
+                file=audio_file,
+                language="en",
+            )
+
+        # Ensure the response contains a valid transcript
+        if not hasattr(transcription, "text"):
+            raise ValueError("Transcription failed. No text returned.")
+
+        return TranscriptionReturnType(transcription.text, transcription)
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential_jitter(2, 128),
+        retry=llm_retry_condition,
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
+    )
+    async def transcribe_image(
+        self,
+        input: str,
+        prompt: str | None = None,
+        max_completion_tokens: int | None = None,
+        reasoning_effort: str | None = None,
+    ) -> str:
+        """
+        Transcribe content from an image using base64 encoding.
+
+        This synchronous method takes an input image file, encodes it as base64, and returns the
+        transcription of its content. Raises a FileNotFoundError if the input file does not
+        exist, and raises a ValueError if the transcription fails or no valid response is
+        received.
+
+        Parameters:
+        -----------
+
+            - input (str): The path to the image file to be transcribed.
+            - prompt: Optional extraction instruction; falls back to "What's in this image?".
+            - max_completion_tokens: Optional length cap; falls back to 300 when omitted.
+            - reasoning_effort: Accepted for interface compatibility; ignored by Ollama.
+
+        Returns:
+        --------
+
+            - str: The transcription of the image's content as a string.
+        """
+
+        async with open_data_file(input, mode="rb") as image_file:
+            encoded_image = base64.b64encode(image_file.read()).decode("utf-8")
+
+        response = await self.client.chat.completions.create(
+            model=self.image_transcribe_model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt or "What's in this image?"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{encoded_image}"},
+                        },
+                    ],
+                }
+            ],
+            max_completion_tokens=max_completion_tokens or 300,
+        )
+
+        # Ensure response is valid before accessing .choices[0].message.content
+        if (
+            not hasattr(response, "choices")
+            or not response.choices
+            or response.choices[0].message is None
+        ):
+            raise ValueError("Image transcription failed. No response received.")
+
+        content = response.choices[0].message.content
+        if content is None:
+            raise ValueError("Image transcription failed. No content returned.")
+
+        return content

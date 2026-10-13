@@ -1,0 +1,36 @@
+name: Reusable Notebook Tests
+
+# Least-privilege GITHUB_TOKEN (OSSF Scorecard: Token-Permissions). A caller can
+# only narrow this further. packages: read is required: the jobs run inside the
+# private ghcr.io CI image (and pull ghcr.io service images), which the runner
+# fetches with this token before the first step. Nothing here writes.
+permissions:
+  contents: read
+  packages: read
+
+on:
+  workflow_call:
+    inputs:
+      ci-image:
+        required: false
+        type: string
+        default: ''
+
+env:
+  COGNEE_SKIP_CONNECTION_TEST: 'true'
+
+jobs:
+#  run-main-notebook:
+#    name: Main Notebook Test
+#    uses: ./.github/workflows/reusable_notebook.yml
+#    with:
+#      notebook-location: notebooks/cognee_demo.ipynb
+#    secrets: inherit
+
+  run-cognee-multimedia:
+    name: Cognee Multimedia Notebook
+    uses: ./.github/workflows/reusable_notebook.yml
+    with:
+      notebook-location: notebooks/cognee_multimedia_demo.ipynb
+      ci-image: ${{ inputs.ci-image }}
+    secrets: inherit

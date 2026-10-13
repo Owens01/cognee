@@ -1,0 +1,175 @@
+from typing import cast
+from uuid import UUID
+
+from cognee.context_global_variables import session_user
+from cognee.exceptions import CogneeValidationError
+from cognee.infrastructure.databases.cache.models import SessionQAEntry
+from cognee.infrastructure.databases.exceptions import DatabaseNotCreatedError
+from cognee.infrastructure.session.get_session_manager import get_session_manager
+from cognee.modules.users.exceptions.exceptions import UserNotFoundError
+from cognee.modules.users.methods import get_default_user
+from cognee.modules.users.models import User
+from cognee.shared.logging_utils import get_logger
+
+logger = get_logger("session_api_sdk")
+
+
+async def _resolve_user(user: User | None) -> User:
+    if user is not None:
+        if getattr(user, "id", None) is None:
+            raise CogneeValidationError(
+                message="Session user must have an id.",
+                name="SessionPreconditionError",
+            )
+        return user
+    ctx_user = session_user.get()
+    if ctx_user is not None and getattr(ctx_user, "id", None) is not None:
+        return ctx_user
+    try:
+        return await get_default_user()
+    except (DatabaseNotCreatedError, UserNotFoundError) as error:
+        raise CogneeValidationError(
+            message=(
+                "Session prerequisites not met: no default user found. "
+                "Initialize Cognee before using session APIs by running "
+                "`await cognee.add(...)` followed by `await cognee.cognify()`."
+            ),
+            name="SessionPreconditionError",
+        ) from error
+
+
+async def _default_dataset_id(user: User) -> UUID:
+    """The caller's existing ``main_dataset`` id.
+
+    Read-only — never creates a dataset. Raises when none exists: a bare
+    default-session read has nothing to be scoped to before any data was
+    added, and silently reading an unscoped global session instead would
+    hide the real problem."""
+    from cognee.modules.data.constants import DEFAULT_DATASET_NAME
+    from cognee.modules.data.methods import get_datasets_by_name
+
+    datasets = await get_datasets_by_name([DEFAULT_DATASET_NAME], cast(UUID, user.id))
+    if not datasets:
+        raise CogneeValidationError(
+            message=(
+                "Session prerequisites not met: no main_dataset exists for this user, "
+                "so there is no default session to read. Add data first "
+                "(`await cognee.add(...)` or `await cognee.remember(...)`), run inside "
+                "a dataset context, or pass an explicit session_id."
+            ),
+            name="SessionPreconditionError",
+        )
+    return cast(UUID, datasets[0].id)
+
+
+async def get_session(
+    session_id: str | None = None,
+    last_n: int | None = None,
+    user: User | None = None,
+) -> list[SessionQAEntry]:
+    """Return a session's Q&A entries.
+
+    ``session_id=None`` resolves to the same per-dataset default session the
+    write side uses — from the active dataset context, or, for a bare call,
+    the caller's existing ``main_dataset``, so a default-session write is
+    readable back through this function. A bare call with no main_dataset
+    raises: there is no default session before any data was added. Passing
+    the literal ``"default_session"`` always reads the global (legacy)
+    session.
+    """
+    resolved_user = await _resolve_user(user)
+    user_id = str(resolved_user.id)
+
+    sm = get_session_manager()
+    if session_id is None and sm.dataset_id is None:
+        # Bare read outside any dataset context: scope to the caller's
+        # main_dataset so the session that dataset-scoped writes used is
+        # found. Read-only; raises when no main_dataset exists.
+        sm = get_session_manager(dataset_id=await _default_dataset_id(resolved_user))
+    raw = await sm.get_session(
+        user_id=user_id,
+        session_id=session_id,
+        last_n=last_n,
+        formatted=False,
+    )
+
+    if not raw:
+        return []
+
+    result: list[SessionQAEntry] = []
+    for entry in raw:
+        if isinstance(entry, dict):
+            try:
+                result.append(SessionQAEntry.model_validate(entry))
+            except Exception as e:
+                logger.warning("get_session: skip invalid entry: %s", e, exc_info=True)
+        elif isinstance(entry, SessionQAEntry):
+            result.append(entry)
+        else:
+            logger.warning("get_session: skip non-dict non-SessionQAEntry entry: %s", type(entry))
+    return result
+
+
+async def add_feedback(
+    session_id: str,
+    qa_id: str,
+    feedback_text: str | None = None,
+    feedback_score: int | None = None,
+    user: User | None = None,
+) -> bool:
+    """Add or update feedback for a QA entry.
+
+    Args:
+        session_id: Session identifier.
+        qa_id: QA entry identifier.
+        feedback_text: Optional free-text feedback.
+        feedback_score: Optional numeric feedback score.
+        user: User that owns the session. If None, uses session/context user or default user.
+
+    Returns:
+        True if the entry was updated, False if the QA entry was not found or
+        caching is disabled. Any other failure (unreachable cache, misconfigured
+        backend, invalid parameters) raises instead of being reported as False.
+    """
+    resolved_user = await _resolve_user(user)
+    user_id = str(resolved_user.id)
+
+    sm = get_session_manager()
+    return await sm.add_feedback(
+        user_id=user_id,
+        session_id=session_id,
+        qa_id=qa_id,
+        feedback_text=feedback_text,
+        feedback_score=feedback_score,
+    )
+
+
+async def delete_feedback(
+    session_id: str,
+    qa_id: str,
+    user: User | None = None,
+) -> bool:
+    """
+    Clear feedback for a QA entry (sets feedback_text and feedback_score to None).
+
+    When user is None, uses session context or default user.
+
+    Args:
+        session_id: Session identifier.
+        qa_id: QA entry identifier to clear feedback for.
+        user: User that owns the session. If None, uses session/context user or default user.
+
+    Returns:
+        True if feedback was cleared, False if the QA entry was not found or
+        caching is disabled. Any other failure (unreachable cache, misconfigured
+        backend, invalid parameters) raises instead of being reported as False.
+    """
+    resolved_user = await _resolve_user(user)
+    user_id = str(resolved_user.id)
+
+    sm = get_session_manager()
+    return await sm.delete_feedback(
+        user_id=user_id,
+        session_id=session_id,
+        qa_id=qa_id,
+    )

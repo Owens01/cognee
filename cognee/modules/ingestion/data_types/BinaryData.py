@@ -1,0 +1,52 @@
+from contextlib import asynccontextmanager
+from typing import BinaryIO
+
+from cognee.infrastructure.files import FileMetadata, get_file_metadata
+from cognee.infrastructure.utils.run_sync import run_sync
+
+from .IngestionData import IngestionData
+
+
+def create_binary_data(data: BinaryIO):
+    return BinaryData(data)
+
+
+class BinaryData(IngestionData):
+    name: str = None
+    data: BinaryIO = None
+    metadata: FileMetadata = None
+
+    def __init__(self, data: BinaryIO, name: str | None = None):
+        self.name = name
+        self.data = data
+
+    def get_identifier(self):
+        metadata = self.get_metadata()
+
+        return metadata["content_hash"]
+
+    def get_metadata(self):
+        run_sync(self.ensure_metadata())
+
+        return self.metadata
+
+    async def aget_identifier(self):
+        metadata = await self.aget_metadata()
+
+        return metadata["content_hash"]
+
+    async def aget_metadata(self):
+        await self.ensure_metadata()
+
+        return self.metadata
+
+    async def ensure_metadata(self):
+        if self.metadata is None:
+            self.metadata = await get_file_metadata(self.data, name=self.name)
+
+            if self.metadata["name"] is None:
+                self.metadata["name"] = self.name
+
+    @asynccontextmanager
+    async def get_data(self):
+        yield self.data

@@ -1,0 +1,82 @@
+from collections.abc import Awaitable, Callable
+from typing import Any
+
+import cognee
+from cognee.eval_framework.benchmark_adapters.benchmark_adapters import BenchmarkAdapter
+from cognee.modules.chunking.TextChunker import TextChunker
+from cognee.modules.pipelines import run_pipeline
+from cognee.modules.pipelines.tasks.task import Task
+from cognee.shared.logging_utils import ERROR, get_logger
+
+logger = get_logger(level=ERROR)
+
+
+class CorpusBuilderExecutor:
+    def __init__(
+        self,
+        benchmark: str | Any = "Dummy",
+        task_getter: Callable[..., Awaitable[list[Task]]] | None = None,
+    ) -> None:
+        if isinstance(benchmark, str):
+            try:
+                adapter_enum = BenchmarkAdapter(benchmark)
+            except ValueError:
+                raise ValueError(f"Unsupported benchmark: {benchmark}")
+            self.adapter = adapter_enum.adapter_class()
+        else:
+            self.adapter = benchmark
+
+        self.raw_corpus = None
+        self.questions = None
+        self.task_getter = task_getter
+
+    def load_corpus(
+        self,
+        limit: int | None = None,
+        load_golden_context: bool = False,
+        instance_filter: str | list[str] | list[int] | None = None,
+        seed: int = 42,
+    ) -> tuple[list[dict], list[str]]:
+        self.raw_corpus, self.questions = self.adapter.load_corpus(
+            limit=limit,
+            seed=seed,
+            load_golden_context=load_golden_context,
+            instance_filter=instance_filter,
+        )
+        return self.raw_corpus, self.questions
+
+    async def build_corpus(
+        self,
+        limit: int | None = None,
+        chunk_size=1024,
+        chunker=TextChunker,
+        load_golden_context: bool = False,
+        instance_filter: str | list[str] | list[int] | None = None,
+        seed: int = 42,
+    ) -> list[str]:
+        await self.adapter.prepare_corpus()
+        self.load_corpus(
+            limit=limit,
+            load_golden_context=load_golden_context,
+            instance_filter=instance_filter,
+            seed=seed,
+        )
+        await self.run_cognee(chunk_size=chunk_size, chunker=chunker)
+        return self.questions
+
+    async def run_cognee(self, chunk_size=1024, chunker=TextChunker) -> None:
+        await cognee.prune.prune_data()
+        await cognee.prune.prune_system(metadata=True)
+
+        # Benchmarks such as HotpotQA can repeat the same context passage across
+        # multiple questions. Deduplicate before ingestion to avoid racing inserts
+        # of the same deterministic Data.id during batched add() processing.
+        unique_corpus = list(dict.fromkeys(self.raw_corpus))
+
+        await cognee.add(unique_corpus)
+
+        tasks = await self.task_getter(chunk_size=chunk_size, chunker=chunker)
+        pipeline_run = run_pipeline(tasks=tasks)
+
+        async for run_info in pipeline_run:
+            print(run_info)

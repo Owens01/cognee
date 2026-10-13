@@ -1,0 +1,141 @@
+from typing import Any
+
+from cognee.infrastructure.databases.unified import get_unified_engine
+from cognee.infrastructure.databases.vector.exceptions.exceptions import CollectionNotFoundError
+from cognee.modules.retrieval.base_retriever import BaseRetriever
+from cognee.modules.retrieval.exceptions.exceptions import NoDataError
+from cognee.shared.logging_utils import get_logger
+
+logger = get_logger("ChunksRetriever")
+
+
+class ChunksRetriever(BaseRetriever):
+    """
+    Handles document chunk-based searches by retrieving relevant chunks and generating
+    completions from them.
+
+    Public methods:
+
+    - get_context: Retrieves document chunks based on a query.
+    - get_completion: Generates a completion using provided context or retrieves context if
+    not given.
+    """
+
+    # Chunk search returns raw payloads and never calls an LLM, so the conversational
+    # session-turn analysis would add a pre-retrieval LLM round trip to an otherwise
+    # sub-second, deterministic path. Opt out, like the other non-generative retrievers.
+    supports_session_turn_preparation = False
+
+    def __init__(
+        self,
+        top_k: int | None = 5,
+        node_name: list[str] | None = None,
+        node_name_filter_operator: str = "OR",
+    ):
+        """
+        Initializes the chunk retriever.
+
+        Parameters:
+        -----------
+
+            - top_k (Optional[int]): Maximum number of chunks to retrieve.
+              Defaults to 5.
+            - node_name (Optional[List[str]]): Node names used to filter chunks by
+              their belongs_to_set relationship. Defaults to None, which applies no
+              node set filtering.
+            - node_name_filter_operator (str): Logical operator used when applying
+              multiple node_name filters, such as "OR" or "AND". Defaults to "OR".
+        """
+        self.top_k = top_k
+        self.node_name = node_name
+        self.node_name_filter_operator = node_name_filter_operator
+
+    async def get_completion_from_context(
+        self, query: str, retrieved_objects: Any, context: Any
+    ) -> list[str] | list[dict]:
+        """
+        Generates a completion using document chunks context.
+        In case of the Chunks Retriever, we do not generate a completion, we just return
+        the payloads of found chunks.
+
+        Parameters:
+        -----------
+
+            - query (str): The query string to be used for generating a completion.
+            - retrieved_objects (Any): The retrieved objects to be used for generating a completion.
+            - context (Any): The context to be used for generating a completion.
+
+        Returns:
+        --------
+
+            - List[dict]: A list of payloads of found chunks. Each payload carries the
+              vector search ``score`` of the chunk: the raw backend distance (cosine
+              distance for built-in adapters), where a lower value is a better match.
+        """
+        # TODO: Do we want to generate a completion using LLM here?
+        if retrieved_objects:
+            chunk_payloads = [
+                {**(found_chunk.payload or {}), "score": found_chunk.score}
+                for found_chunk in retrieved_objects
+            ]
+            return chunk_payloads
+        else:
+            return []
+
+    async def get_context_from_objects(self, query: str, retrieved_objects: Any) -> str:
+        """
+        Retrieves context from retrieved chunks, in text form.
+
+        Parameters:
+        -----------
+
+            - query (str): The query string used to search for relevant document chunks.
+            - retrieved_objects (Any): The retrieved objects to be used for generating textual context.
+
+        Returns:
+        --------
+
+            - str: A string containing the combined text of the retrieved chunks, or an
+              empty string if none are found.
+        """
+        if retrieved_objects:
+            chunk_payload_texts = [found_chunk.payload["text"] for found_chunk in retrieved_objects]
+            return "\n".join(chunk_payload_texts)
+        else:
+            return ""
+
+    async def get_retrieved_objects(self, query: str) -> Any:
+        """
+        Retrieves document chunks context based on the query.
+        Searches for document chunks relevant to the specified query using a vector engine.
+        Raises a NoDataError if no data is found in the system.
+        Parameters:
+        -----------
+            - query (str): The query string to search for relevant document chunks.
+        Returns:
+        --------
+            - Any: A list of document chunks retrieved from the search.
+        """
+        logger.info(
+            f"Starting chunk retrieval for query: '{query[:100]}{'...' if len(query) > 100 else ''}'"
+        )
+
+        unified = await get_unified_engine()
+        vector_engine = unified.vector
+
+        try:
+            found_chunks = await vector_engine.search(
+                "DocumentChunk_text",
+                query,
+                limit=self.top_k,
+                include_payload=True,
+                node_name=self.node_name,
+                node_name_filter_operator=self.node_name_filter_operator,
+            )
+            logger.info(f"Found {len(found_chunks)} chunks from vector search")
+
+            return found_chunks
+
+        except CollectionNotFoundError as error:
+            logger.error("DocumentChunk_text collection not found in vector database")
+            raise NoDataError("No data found in the system, please add data first.") from error

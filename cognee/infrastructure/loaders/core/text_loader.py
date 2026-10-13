@@ -1,0 +1,104 @@
+import os
+from typing import Any
+
+from cognee.infrastructure.files.storage import get_file_storage, get_storage_config
+from cognee.infrastructure.files.utils.get_file_metadata import get_file_metadata
+from cognee.infrastructure.loaders.exceptions import UnreadableFileContentError
+from cognee.infrastructure.loaders.LoaderInterface import LoaderInterface, LoaderResult
+from cognee.infrastructure.loaders.store_derived_text import store_derived_text
+
+
+class TextLoader(LoaderInterface):
+    """
+    Core text file loader that handles basic text file formats.
+
+    This loader is always available and serves as the fallback for
+    text-based files when no specialized loader is available.
+    """
+
+    loader_name = "text_loader"
+
+    @property
+    def supported_extensions(self) -> list[str]:
+        """Supported text file extensions."""
+        return ["txt", "md", "json", "xml", "yaml", "yml", "log"]
+
+    @property
+    def supported_mime_types(self) -> list[str]:
+        """Supported MIME types for text content."""
+        return [
+            "text/plain",
+            "text/markdown",
+            "application/json",
+            "text/xml",
+            "application/xml",
+            "text/yaml",
+            "application/yaml",
+        ]
+
+    def can_handle(self, extension: str, mime_type: str) -> bool:
+        """
+        Check if this loader can handle the given file.
+
+        Args:
+            extension: File extension
+            mime_type: Optional MIME type
+
+        Returns:
+            True if file can be handled, False otherwise
+        """
+        return bool(
+            extension in self.supported_extensions and mime_type in self.supported_mime_types
+        )
+
+    async def load(
+        self, file_path: str, encoding: str = "utf-8", **kwargs: Any
+    ) -> "str | LoaderResult":
+        """
+        Load and process the text file.
+
+        Args:
+            file_path: Path to the file to load
+            encoding: Text encoding to use (default: utf-8)
+            **kwargs: Additional configuration (unused)
+
+        Returns:
+            LoaderResult containing the file content and metadata
+
+        Raises:
+            FileNotFoundError: If file doesn't exist
+            UnreadableFileContentError: If the bytes are not text in this encoding
+            OSError: If file cannot be read
+        """
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        with open(file_path, "rb") as f:
+            file_metadata = await get_file_metadata(f)
+        # Name ingested file of current loader based on original file content hash
+        storage_file_name = "text_" + file_metadata["content_hash"] + ".txt"
+
+        try:
+            with open(file_path, encoding=encoding) as f:
+                content = f.read()
+        except UnicodeDecodeError as error:
+            # This loader is the content-detection fallback, so a binary file
+            # whose bytes the sniffer reads as text/plain (a .dmg, an archive)
+            # lands here. Refuse it by media type instead of letting the
+            # decode error escape as an untyped 500.
+            raise UnreadableFileContentError(
+                f"'{os.path.basename(file_path)}' cannot be read as text: decoding it as "
+                f"{encoding} failed ({error.reason} at byte {error.start}). Its content was "
+                "detected as plain text, but the bytes are binary, so no cognee loader can "
+                f"read this file. Supported text extensions: {', '.join(self.supported_extensions)}; "
+                "PDFs and office documents need their own loader (the `docling` extra)."
+            ) from error
+
+        if not kwargs.get("persist", True):
+            return content
+
+        storage_config = get_storage_config()
+        data_root_directory = storage_config["data_root_directory"]
+        storage = get_file_storage(data_root_directory)
+
+        return await store_derived_text(storage, storage_file_name, content)

@@ -1,0 +1,167 @@
+from typing import Any
+
+from pydantic import BaseModel, Field, field_validator
+
+from cognee.modules.agent_memory.sanitization import (
+    MAX_SERIALIZED_VALUE_LENGTH,
+    sanitize_value,
+    truncate_text,
+)
+
+
+def _validate_list_of_str(value: object, key: str) -> list[str]:
+    if not isinstance(value, list):
+        raise ValueError(f"{key} must be a list")
+    for i, item in enumerate(value):
+        if not isinstance(item, str):
+            raise ValueError(f"{key}[{i}] must be a string")
+    return value
+
+
+class SessionQAEntry(BaseModel):
+    """
+    Canonical format for a QA entry stored in session cache.
+
+    Fields:
+        time: ISO format timestamp when the QA was created.
+        qa_id: Unique identifier for the entry (required for update/delete).
+        question: User's question.
+        context: Context used to generate the answer.
+        answer: Generated answer.
+        feedback_text: Optional user feedback text.
+        feedback_score: Optional feedback score 1-5.
+        used_graph_element_ids: Optional dict with only "node_ids" and "edge_ids" (lists of str).
+        memify_metadata: Optional dict with memify status keys (e.g. "feedback_weights_applied").
+            Values are bools, ints (attempt counters), strings (the applied rating's
+            source) or lists of str (applied element ids).
+        used_session_context_ids: Optional list of session-context entry ids served to this answer.
+    """
+
+    time: str
+    question: str
+    context: str
+    answer: str
+    qa_id: str | None = None
+    feedback_text: str | None = None
+    feedback_score: int | None = None
+    used_graph_element_ids: dict[str, list[str]] | None = None
+    memify_metadata: dict[str, Any] | None = None
+    used_session_context_ids: list[str] | None = None
+
+    @field_validator("used_graph_element_ids")
+    @classmethod
+    def used_graph_element_ids_only_node_and_edge_ids(
+        cls, v: dict[str, list[str]] | None
+    ) -> dict[str, list[str]] | None:
+        if v is None:
+            return None
+        if not isinstance(v, dict):
+            raise ValueError("used_graph_element_ids must be a dict or None")
+        allowed = {"node_ids", "edge_ids"}
+        if set(v.keys()) - allowed:
+            raise ValueError("used_graph_element_ids may only have keys 'node_ids' and 'edge_ids'")
+        out: dict[str, list[str]] = {}
+        if "node_ids" in v:
+            out["node_ids"] = _validate_list_of_str(v["node_ids"], "node_ids")
+        if "edge_ids" in v:
+            out["edge_ids"] = _validate_list_of_str(v["edge_ids"], "edge_ids")
+        return out if out else None
+
+    @field_validator("used_session_context_ids")
+    @classmethod
+    def validate_used_session_context_ids(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
+        validated = _validate_list_of_str(v, "used_session_context_ids")
+        return validated if validated else None
+
+    @field_validator("feedback_score")
+    @classmethod
+    def feedback_score_range(cls, v: int | None) -> int | None:
+        if v is not None and (v < 1 or v > 5):
+            raise ValueError("feedback_score must be between 1 and 5")
+        return v
+
+    @field_validator("memify_metadata")
+    @classmethod
+    def memify_metadata_only_pipeline_keys(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
+        if v is None:
+            return None
+        if not isinstance(v, dict):
+            raise ValueError("memify_metadata must be a dict or None")
+        out: dict[str, Any] = {}
+        for key, val in v.items():
+            if not isinstance(key, str):
+                raise ValueError("memify_metadata may only have string keys")
+            # Strings joined the whitelist with the feedback-weight bookkeeping
+            # (the applied rating's source, "explicit"/"implicit"); ints and id
+            # lists arrived with the same bookkeeping. Every widening here is a
+            # rolling-deploy caveat: pods on an older release reject rows
+            # carrying the new type at read time (release-notes item).
+            is_scalar = isinstance(val, (bool, int, str))
+            is_id_list = isinstance(val, list) and all(isinstance(item, str) for item in val)
+            if not (is_scalar or is_id_list):
+                raise ValueError(
+                    "memify_metadata values may only be bools, ints, strings or lists of strings"
+                )
+            out[key] = val
+        return out if out else None
+
+
+class SessionAgentTraceEntry(BaseModel):
+    """
+    Canonical format for one agent trace step stored in session cache.
+
+    Fields:
+        trace_id: Unique identifier for the trace step.
+        origin_function: Agent method/function that produced the step.
+        status: Execution status for the step.
+        memory_query: Optional memory lookup query used by the step.
+        memory_context: Optional memory context returned to the step.
+        method_params: Serialized method parameters for the step.
+        method_return_value: Serialized method return value for the step.
+        error_message: Error details for failed steps.
+        session_feedback: Per-step feedback generated from the step only.
+    """
+
+    trace_id: str
+    origin_function: str
+    status: str
+    memory_query: str = ""
+    memory_context: str = ""
+    method_params: dict[str, Any] = Field(default_factory=dict)
+    method_return_value: Any = None
+    error_message: str = ""
+    session_feedback: str = ""
+
+    @field_validator("trace_id", "origin_function", "status")
+    @classmethod
+    def required_non_empty_string(cls, v: str) -> str:
+        if not isinstance(v, str):
+            raise ValueError("value must be a string")
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError("value must be a non-empty string")
+        return truncate_text(stripped, MAX_SERIALIZED_VALUE_LENGTH)
+
+    @field_validator("memory_query", "memory_context", "error_message", "session_feedback")
+    @classmethod
+    def normalize_optional_text_fields(cls, v: str) -> str:
+        if not isinstance(v, str):
+            raise ValueError("value must be a string")
+        return truncate_text(v.strip(), MAX_SERIALIZED_VALUE_LENGTH)
+
+    @field_validator("method_params")
+    @classmethod
+    def sanitize_method_params(cls, v: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(v, dict):
+            raise ValueError("method_params must be a dict")
+        sanitized = sanitize_value(v)
+        if not isinstance(sanitized, dict):
+            raise ValueError("method_params must sanitize to a dict")
+        return sanitized
+
+    @field_validator("method_return_value")
+    @classmethod
+    def sanitize_method_return_value(cls, v: Any) -> Any:
+        return sanitize_value(v)

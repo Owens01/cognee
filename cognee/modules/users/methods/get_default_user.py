@@ -1,0 +1,58 @@
+from types import SimpleNamespace
+
+from sqlalchemy.exc import NoResultFound, OperationalError
+from sqlalchemy.future import select
+from sqlalchemy.orm import selectinload
+
+from cognee.base_config import get_base_config
+from cognee.infrastructure.databases.exceptions import DatabaseNotCreatedError
+from cognee.infrastructure.databases.relational import get_relational_engine
+from cognee.modules.users.exceptions.exceptions import UserNotFoundError
+from cognee.modules.users.methods.create_default_user import create_default_user
+from cognee.modules.users.models import User
+
+
+async def get_default_user() -> User:
+    db_engine = get_relational_engine()
+    base_config = get_base_config()
+    default_email = base_config.default_user_email or "default_user@example.com"
+
+    try:
+        async with db_engine.get_async_session() as session:
+            query = (
+                select(User)
+                .options(selectinload(User.roles), selectinload(User.tenants))
+                .where(User.email == default_email)
+            )
+
+            result = await session.execute(query)
+            user = result.scalars().first()
+
+        # Our session is closed here (the `async with` has exited), so
+        # create_default_user — which opens its own session — no longer runs
+        # nested inside it: we never hold two pooled connections at once (#4197
+        # class). It stays inside this `try` so a missing-database error still
+        # maps to DatabaseNotCreatedError.
+        if user is None:
+            return await create_default_user()
+
+        return user
+    except Exception as error:
+        error_text = str(error.args)
+        # log=False on both raises below: every consumer treats this exception
+        # as a recoverable signal (the CLI auto-creates the database and
+        # retries — cognee/cli/user_resolution.py), so an ERROR log line here
+        # would alarm users on every fresh install.
+        if "principals" in error_text:
+            raise DatabaseNotCreatedError(log=False) from error
+        # Fresh install: the SQLite file/directory or the schema does not exist
+        # yet. Without this classification the CLI's auto-migration recovery
+        # never fires and the user sees a raw
+        # "(sqlite3.OperationalError) unable to open database file".
+        if isinstance(error, OperationalError) and (
+            "unable to open database file" in error_text or "no such table" in error_text
+        ):
+            raise DatabaseNotCreatedError(log=False) from error
+        if isinstance(error, NoResultFound):
+            raise UserNotFoundError(f"Failed to retrieve default user: {default_email}") from error
+        raise

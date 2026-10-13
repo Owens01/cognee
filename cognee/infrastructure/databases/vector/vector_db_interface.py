@@ -1,0 +1,394 @@
+from abc import abstractmethod
+from typing import Any, Protocol
+from uuid import UUID
+
+from cognee.infrastructure.engine import DataPoint
+from cognee.modules.users.models import User
+
+from .models.PayloadSchema import PayloadSchema
+
+
+class VectorDBInterface(Protocol):
+    """
+    Interface every vector backend implements (LanceDB, PGVector, Neptune Analytics, Turso).
+
+    Get an instance with ``get_vector_engine_async()``; never construct adapters directly.
+
+    Contract shared by all adapters:
+
+    * **One collection per embedded field.** ``add_data_points`` writes each ``DataPoint``
+      type's ``index_fields`` to a collection named ``<TypeName>_<field>``
+      (``DocumentChunk_text``, ``Entity_name``, ``TextSummary_text``, ...). Rows are keyed
+      by the data point's id.
+    * **Writes are idempotent upserts.** ``create_data_points`` replaces an existing row
+      with the same id (LanceDB additionally merges the ``belongs_to_set`` tags of the
+      old and new row). Embedding is done by the adapter through the configured
+      embedding engine.
+    * **Search returns ``list[ScoredResult]``** (``id``, ``score``, ``payload``), ordered by
+      ``score`` ascending. ``score`` is the backend's raw distance -- cosine distance for
+      the built-in adapters -- so **lower is better**; it is not a similarity.
+    * Ids are passed and returned as ``UUID``/``str`` of the ``DataPoint.id``; missing ids
+      in ``retrieve``/``score_by_ids`` are omitted from the result, not an error.
+
+    Multi-tenant isolation requires a ``DatasetDatabaseHandlerInterface`` registration
+    for the backend (see ``dataset_database_handler/``).
+    """
+
+    @abstractmethod
+    async def has_collection(self, collection_name: str) -> bool:
+        """
+        Check if a specified collection exists.
+
+        Parameters:
+        -----------
+
+            - collection_name (str): The name of the collection to check for existence.
+
+        Returns:
+        --------
+
+            - bool: True if the collection exists, otherwise False.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def create_collection(
+        self,
+        collection_name: str,
+        payload_schema: Any | None = None,
+    ):
+        """
+        Create a new collection with an optional payload schema.
+
+        Parameters:
+        -----------
+
+            - collection_name (str): The name of the new collection to create.
+            - payload_schema (Optional[Any]): An optional schema for the payloads
+              within this collection. Can be PayloadSchema, BaseModel, or other schema types. (default None)
+        """
+        raise NotImplementedError
+
+    """ Data points """
+
+    @abstractmethod
+    async def create_data_points(self, collection_name: str, data_points: list[DataPoint]):
+        """
+        Upsert data points into the specified collection.
+
+        Keyed on ``DataPoint.id``: an existing row is replaced (LanceDB merges its
+        ``belongs_to_set`` with the new row's), a new id is inserted. The adapter embeds
+        each point's ``get_embeddable_data()`` with the configured embedding engine and
+        creates the collection if it does not exist. Returns ``None``.
+
+        Parameters:
+        -----------
+
+            - collection_name (str): The name of the collection where data points will be added.
+            - data_points (List[DataPoint]): A list of data points to be added to the
+              collection.
+        """
+        raise NotImplementedError
+
+    async def upsert_raw_vectors(
+        self,
+        collection_name: str,
+        points: list[dict],
+        payload_schema: Any | None = None,
+    ) -> None:
+        """
+        Upsert already-computed vectors into the specified collection.
+
+        This is for small system-owned vector state where re-embedding from text would be
+        incorrect. Adapters that do not support raw vector writes should raise
+        NotImplementedError.
+        """
+        raise NotImplementedError("upsert_raw_vectors is not implemented for this adapter")
+
+    @abstractmethod
+    async def retrieve(self, collection_name: str, data_point_ids: list[str]):
+        """
+        Retrieve data points from a collection using their IDs.
+
+        Parameters:
+        -----------
+
+            - collection_name (str): The name of the collection from which to retrieve data
+              points.
+            - data_point_ids (Union[List[str], list[str]]): A list of IDs of the data points to retrieve.
+        """
+        raise NotImplementedError
+
+    async def score_by_ids(
+        self, collection_name: str, data_point_ids: list[str], query_vector: list[float]
+    ):
+        """Return raw cosine distances for existing requested IDs, with no top-k cutoff.
+
+        Empty IDs return []; missing IDs are omitted and result order is unspecified.
+        Implementations must filter by ID before scoring and bound query batches,
+        rather than searching the whole collection. This optional capability raises
+        NotImplementedError on adapters that do not support neighborhood re-scoring.
+        """
+        raise NotImplementedError("score_by_ids is not implemented for this adapter")
+
+    """ Search """
+
+    @abstractmethod
+    async def search(
+        self,
+        collection_name: str,
+        query_text: str | None,
+        query_vector: list[float] | None,
+        limit: int | None,
+        with_vector: bool = False,
+        include_payload: bool = False,
+        node_name: list[str] | None = None,
+        node_name_filter_operator: str = "OR",
+    ):
+        """
+        Perform a search in the specified collection using either a text query or a vector
+        query.
+
+        Exactly one of ``query_text`` / ``query_vector`` is required; text is embedded
+        first. Returns ``list[ScoredResult]`` ordered by ``score`` ascending, where
+        ``score`` is the raw backend distance (cosine for built-in adapters; lower is
+        better). ``limit=None`` returns every row; ``limit<=0`` returns ``[]``.
+
+        Parameters:
+        -----------
+
+            - collection_name (str): The name of the collection in which to perform the search.
+            - query_text (Optional[str]): An optional text query to search for in the
+              collection.
+            - query_vector (Optional[List[float]]): An optional vector representation for
+              searching the collection.
+            - limit (Optional[int]): The maximum number of results to return from the search.
+            - with_vector (bool): Whether to return the vector representations with search
+              results. (default False)
+            - include_payload (bool): Whether to include the payload data with search. Search is faster when set to False.
+              Payload contains metadata about the data point, useful for searches that are only based on embedding distances
+              like the RAG_COMPLETION search type, but not needed when search also contains graph data.
+            - node_name (Optional[List[str]]): An optional list of names of nodes. Search results are filtered
+              based on these, and only data which has at least one of the names in its "belongs_to_set" field is returned.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def batch_search(
+        self,
+        collection_name: str,
+        query_texts: list[str],
+        limit: int | None,
+        with_vectors: bool = False,
+        include_payload: bool = False,
+        node_name: list[str] | None = None,
+    ):
+        """
+        Perform a batch search using multiple text queries against a collection.
+
+        Parameters:
+        -----------
+
+            - collection_name (str): The name of the collection to conduct the batch search in.
+            - query_texts (List[str]): A list of text queries to use for the search.
+            - limit (Optional[int]): The maximum number of results to return for each query.
+            - with_vectors (bool): Whether to include vector representations with search
+              results. (default False)
+            - include_payload (bool): Whether to include the payload data with search. Search is faster when set to False.
+              Payload contains metadata about the data point, useful for searches that are only based on embedding distances
+              like the RAG_COMPLETION search type, but not needed when search also contains graph data.
+        """
+        raise NotImplementedError
+
+    # Whether this adapter implements update_payload. Callers must check this
+    # BEFORE relying on payload-only updates and take a re-embedding write
+    # path when it is False.
+    supports_payload_update: bool = False
+
+    async def update_payload(
+        self, collection_name: str, payload_updates: dict[str, dict[str, Any]]
+    ) -> None:
+        """
+        Update payload fields on existing rows WITHOUT re-embedding.
+
+        Used for metadata-only changes (e.g. a chunk's ``chunk_index`` after an
+        incremental document update repositioned it): the stored vector is
+        preserved exactly, so no embedding call happens. Missing ids are skipped.
+
+        CALLER CONTRACT: every field named here must ALREADY exist in the
+        collection's payload schema. Collections written by older versions
+        predate fields added since (``content_hash``, for one), and this call
+        does not migrate a schema — it writes into the one that is there. A
+        caller wanting to set a field that may be absent has to go through the
+        re-embedding write path instead. This is stated on the interface rather
+        than in one caller's comment because it binds every implementation and
+        the next caller will not otherwise know the rule exists.
+
+        Parameters:
+        -----------
+
+            - collection_name (str): The collection holding the rows.
+            - payload_updates (Dict[str, Dict[str, Any]]): Mapping of data
+              point id (string form) to the payload fields to overwrite.
+        """
+        raise NotImplementedError("This vector adapter does not support payload-only updates.")
+
+    @abstractmethod
+    async def delete_data_points(self, collection_name: str, data_point_ids: list[UUID]):
+        """
+        Delete specified data points from a collection.
+
+        Implementations should be idempotent for missing collections, empty ID
+        lists, and missing point IDs.
+
+        Parameters:
+        -----------
+
+            - collection_name (str): The name of the collection from which to delete data
+              points.
+            - data_point_ids (Union[List[str], list[str]]): A list of IDs of the data points to delete.
+        """
+        raise NotImplementedError
+
+    async def remove_belongs_to_set_tags(
+        self,
+        tags: list[str],
+        node_ids: list[str] | None = None,
+    ) -> None:
+        """
+        Remove the given tag names from every `belongs_to_set` array in the
+        adapter's vector collections and delete rows whose `belongs_to_set`
+        becomes empty as a result. Keeps the stored tags consistent with
+        the graph after a dataset or NodeSet is removed.
+
+        When `node_ids` is provided, the detag is scoped to rows whose id
+        is in the list — used to reconcile shared rows that lose one
+        dataset's anchor while other datasets still own them. Rows
+        emptied by a scoped detag are still deleted, mirroring the
+        unscoped path.
+
+        Default no-op; adapters that need to clean up stale NodeSet tags
+        on dataset deletion override this.
+        """
+        return
+
+    @abstractmethod
+    async def prune(self):
+        """
+        Remove obsolete or unnecessary data from the database.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def embed_data(self, data: list[str]) -> list[list[float]]:
+        """
+        Embed textual data into vector representations.
+
+        Parameters:
+        -----------
+
+            - data (List[str]): A list of strings to be embedded.
+
+        Returns:
+        --------
+
+            - List[List[float]]: A list of embedded vectors corresponding to the input data.
+        """
+        raise NotImplementedError
+
+    # Optional methods that may be implemented by adapters
+    async def compact(self, collection_name: str | None = None):
+        """
+        Reclaim storage the adapter's own writes left behind (merge small
+        fragments, prune superseded versions). Called once at the end of every
+        cognify run; must be cheap when there is nothing to do, bounded in
+        work, and must never raise. Default implementation is a no-op.
+        """
+        return
+
+    async def run_migrations(self):
+        """
+        Run adapter-specific vector storage migrations.
+        Default implementation is a no-op.
+        """
+        return
+
+    async def get_connection(self):
+        """
+        Get a connection to the vector database.
+        This method is optional and may return None for adapters that don't use connections.
+        """
+        return
+
+    async def get_collection(self, collection_name: str):
+        """
+        Get a collection object from the vector database.
+        This method is optional and may return None for adapters that don't expose collection objects.
+        """
+        return
+
+    async def create_vector_index(self, index_name: str, index_property_name: str):
+        """
+        Create a vector index for improved search performance.
+        This method is optional and may be a no-op for adapters that don't support indexing.
+        """
+
+    async def index_data_points(
+        self, index_name: str, index_property_name: str, data_points: list[DataPoint]
+    ):
+        """
+        Index data points for improved search performance.
+        This method is optional and may be a no-op for adapters that don't support separate indexing.
+
+        Parameters:
+        -----------
+            - index_name (str): Name of the index to create/update
+            - index_property_name (str): Property name to index on
+            - data_points (List[DataPoint]): Data points to index
+        """
+
+    def get_data_point_schema(self, model_type: Any) -> Any:
+        """
+        Get or transform a data point schema for the specific vector database.
+        This method is optional and may return the input unchanged for simple adapters.
+
+        Parameters:
+        -----------
+            - model_type (Any): The model type to get schema for
+
+        Returns:
+        --------
+            - Any: The schema object suitable for this vector database
+        """
+        return model_type
+
+    @classmethod
+    async def create_dataset(cls, dataset_id: UUID | None, user: User | None) -> dict:
+        """
+        Return a dictionary with connection info for a vector database for the given dataset.
+        Function can auto handle deploying of the actual database if needed, but is not necessary.
+        Only providing connection info is sufficient, this info will be mapped when trying to connect to the provided dataset in the future.
+        Needed for Cognee multi-tenant/multi-user and backend access control support.
+
+        Dictionary returned from this function will be used to create a DatasetDatabase row in the relational database.
+        From which internal mapping of dataset -> database connection info will be done.
+
+        Each dataset needs to map to a unique vector database when backend access control is enabled to facilitate a separation of concern for data.
+
+        Args:
+            dataset_id: UUID of the dataset if needed by the database creation logic
+            user: User object if needed by the database creation logic
+        Returns:
+            dict: Connection info for the created vector database instance.
+        """
+
+    async def delete_dataset(self, dataset_id: UUID, user: User) -> None:
+        """
+        Delete the vector database for the given dataset.
+        Function should auto handle deleting of the actual database or send a request to the proper service to delete the database.
+        Needed for maintaining a database for Cognee multi-tenant/multi-user and backend access control.
+
+        Args:
+            dataset_id: UUID of the dataset
+            user: User object
+        """

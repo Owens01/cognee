@@ -1,0 +1,265 @@
+import asyncio
+import importlib
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+from uuid import uuid4
+
+import pytest
+
+from cognee.modules.pipelines.models.PipelineRunInfo import PipelineRunErrored, PipelineRunStarted
+from cognee.modules.pipelines.tasks.task import Task
+
+run_tasks_module = importlib.import_module("cognee.modules.pipelines.operations.run_tasks")
+
+
+class _FakeSession:
+    def __init__(self, dataset):
+        self._dataset = dataset
+
+    async def get(self, _model, _dataset_id):
+        return self._dataset
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class _FakeEngine:
+    def __init__(self, dataset):
+        self._dataset = dataset
+
+    def get_async_session(self):
+        return _FakeSession(self._dataset)
+
+
+@asynccontextmanager
+async def _no_op_context(*_args, **_kwargs):
+    yield
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome", ["success", "empty", "skipped", "flush_error", "cancelled", "item_error"]
+)
+async def test_telemetry_follows_the_whole_run_lifecycle(monkeypatch, outcome):
+    dataset = SimpleNamespace(id=uuid4(), name="private-dataset", owner_id=uuid4())
+    user = SimpleNamespace(id=uuid4(), tenant_id=None)
+    run_id = uuid4()
+    events = []
+    order = []
+    engine = _FakeEngine(dataset)
+
+    def capture(name, _user, additional_properties):
+        events.append((name, additional_properties))
+        order.append(name)
+
+    async def item(*args):
+        if outcome == "cancelled":
+            raise asyncio.CancelledError()
+        if outcome == "item_error":
+            raise ValueError("private error message")
+        # Completed/skipped items are both successful results for the runner.
+        from cognee.modules.pipelines.models.PipelineRunInfo import (
+            PipelineRunAlreadyCompleted,
+            PipelineRunCompleted,
+        )
+
+        cls = PipelineRunAlreadyCompleted if outcome == "skipped" else PipelineRunCompleted
+        return {
+            "run_info": cls(
+                pipeline_run_id=run_id, dataset_id=dataset.id, dataset_name=dataset.name
+            )
+        }
+
+    async def flush():
+        order.append("flush")
+        if outcome == "flush_error":
+            raise OSError("private storage path")
+
+    monkeypatch.setattr(run_tasks_module, "get_relational_engine", lambda: engine)
+    monkeypatch.setattr(
+        run_tasks_module,
+        "get_graph_engine",
+        AsyncMock(return_value=SimpleNamespace(push_to_s3=flush)),
+    )
+    monkeypatch.setattr(run_tasks_module, "set_database_global_context_variables", _no_op_context)
+    monkeypatch.setattr(
+        run_tasks_module,
+        "log_pipeline_run_start",
+        AsyncMock(return_value=SimpleNamespace(pipeline_run_id=run_id)),
+    )
+    monkeypatch.setattr(run_tasks_module, "log_pipeline_run_complete", AsyncMock())
+    monkeypatch.setattr(run_tasks_module, "log_pipeline_run_error", AsyncMock())
+    monkeypatch.setattr(run_tasks_module, "log_pipeline_run_progress", AsyncMock())
+    monkeypatch.setattr(run_tasks_module, "run_tasks_data_item", item)
+    monkeypatch.setattr(run_tasks_module, "send_telemetry", capture)
+    seen_extractors = []
+
+    def properties(*args, graph_extractor, **kwargs):
+        seen_extractors.append(graph_extractor)
+        return {"pipeline_run_id": str(run_id)}
+
+    monkeypatch.setattr(run_tasks_module, "pipeline_run_telemetry_properties", properties)
+
+    async def drain():
+        async for _ in run_tasks_module.run_tasks(
+            [Task(lambda x: x)],
+            dataset.id,
+            [] if outcome == "empty" else [1, 2],
+            user,
+            extras={"graph_extractor": "gliner_demo"},
+        ):
+            pass
+
+    failures = {
+        "flush_error": OSError,
+        "cancelled": asyncio.CancelledError,
+        "item_error": ValueError,
+    }
+    if outcome in failures:
+        with pytest.raises(failures[outcome]):
+            await drain()
+    else:
+        await drain()
+    terminal = "Errored" if outcome in failures else "Completed"
+    assert [name for name, _ in events] == ["Pipeline Run Started", f"Pipeline Run {terminal}"]
+    assert seen_extractors == ["gliner_demo"]
+    assert all(props["pipeline_event_scope"] == "run" for _, props in events)
+    assert all(props["pipeline_run_id"] == str(run_id) for _, props in events)
+    if outcome in failures:
+        assert events[-1][1]["exception_type"] == failures[outcome].__name__
+    if "flush" in order:
+        assert order.index("flush") < order.index(f"Pipeline Run {terminal}")
+    assert "private" not in repr(events)
+
+
+@pytest.mark.asyncio
+async def test_run_tasks_calls_custom_rollback_on_pipeline_failure(monkeypatch):
+    dataset_id = uuid4()
+    user_id = uuid4()
+    owner_id = uuid4()
+    pipeline_run_id = uuid4()
+
+    dataset = SimpleNamespace(id=dataset_id, name="dataset-1", owner_id=owner_id)
+    user = SimpleNamespace(id=user_id, tenant_id=uuid4())
+    data_item = SimpleNamespace(id=uuid4())
+
+    async def _failing_item(*_args, **_kwargs):
+        return {
+            "run_info": PipelineRunErrored(
+                pipeline_run_id=pipeline_run_id,
+                dataset_id=dataset_id,
+                dataset_name=dataset.name,
+                payload="item failed",
+            )
+        }
+
+    rollback_calls = []
+
+    async def _rollback_handler(**kwargs):
+        rollback_calls.append(kwargs)
+
+    monkeypatch.setattr(run_tasks_module, "get_relational_engine", lambda: _FakeEngine(dataset))
+    monkeypatch.setattr(run_tasks_module, "generate_pipeline_id", lambda *_args: uuid4())
+
+    async def _log_start(*_args, **_kwargs):
+        return SimpleNamespace(pipeline_run_id=pipeline_run_id)
+
+    async def _log_error(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        run_tasks_module,
+        "log_pipeline_run_start",
+        _log_start,
+    )
+    monkeypatch.setattr(run_tasks_module, "log_pipeline_run_error", _log_error)
+    monkeypatch.setattr(run_tasks_module, "set_database_global_context_variables", _no_op_context)
+    monkeypatch.setattr(run_tasks_module, "run_tasks_data_item", _failing_item)
+
+    yielded = []
+    async for item in run_tasks_module.run_tasks(
+        tasks=[Task(lambda x: x)],
+        dataset_id=dataset_id,
+        data=[data_item],
+        user=user,
+        pipeline_name="cognify_pipeline",
+        rollback_handler=_rollback_handler,
+    ):
+        yielded.append(item)
+
+    assert len(yielded) == 2
+    assert isinstance(yielded[0], PipelineRunStarted)
+    assert isinstance(yielded[1], PipelineRunErrored)
+
+    assert len(rollback_calls) == 1
+    rollback_payload = rollback_calls[0]
+    assert rollback_payload["pipeline_run_id"] == pipeline_run_id
+    assert rollback_payload["dataset"] == dataset
+    assert rollback_payload["user"] == user
+    assert rollback_payload["data"] == [data_item]
+    assert isinstance(rollback_payload["error"], Exception)
+    assert rollback_payload["data_ingestion_info"][0]["run_info"].status == "PipelineRunErrored"
+
+
+@pytest.mark.asyncio
+async def test_run_tasks_marks_cancelled_run_as_errored_instead_of_stuck(monkeypatch):
+    """CLO-365: asyncio.CancelledError is a BaseException, not an Exception, so
+    a bare `except Exception` in run_tasks.py misses it — a cancelled run
+    (deploy/restart, or a disconnect-triggered cancel) would never reach
+    log_pipeline_run_error and would stay stuck at DATASET_PROCESSING_STARTED
+    forever. This proves log_pipeline_run_error DOES fire for a cancelled
+    run, and that cancellation still propagates out of run_tasks afterward
+    (cooperative cancellation isn't swallowed)."""
+    dataset_id = uuid4()
+    user_id = uuid4()
+    owner_id = uuid4()
+    pipeline_run_id = uuid4()
+
+    dataset = SimpleNamespace(id=dataset_id, name="dataset-1", owner_id=owner_id)
+    user = SimpleNamespace(id=user_id, tenant_id=uuid4())
+    data_item = SimpleNamespace(id=uuid4())
+
+    async def _cancelled_item(*_args, **_kwargs):
+        raise asyncio.CancelledError()
+
+    error_calls = []
+
+    async def _log_error(*_args, **_kwargs):
+        error_calls.append(_args)
+
+    monkeypatch.setattr(run_tasks_module, "get_relational_engine", lambda: _FakeEngine(dataset))
+    monkeypatch.setattr(run_tasks_module, "generate_pipeline_id", lambda *_args: uuid4())
+
+    async def _log_start(*_args, **_kwargs):
+        return SimpleNamespace(pipeline_run_id=pipeline_run_id)
+
+    monkeypatch.setattr(run_tasks_module, "log_pipeline_run_start", _log_start)
+    monkeypatch.setattr(run_tasks_module, "log_pipeline_run_error", _log_error)
+    monkeypatch.setattr(run_tasks_module, "set_database_global_context_variables", _no_op_context)
+    monkeypatch.setattr(run_tasks_module, "run_tasks_data_item", _cancelled_item)
+
+    yielded = []
+    with pytest.raises(asyncio.CancelledError):
+        async for item in run_tasks_module.run_tasks(
+            tasks=[Task(lambda x: x)],
+            dataset_id=dataset_id,
+            data=[data_item],
+            user=user,
+            pipeline_name="cognify_pipeline",
+        ):
+            yielded.append(item)
+
+    # log_pipeline_run_error must have fired — the row is marked errored,
+    # never left stuck at DATASET_PROCESSING_STARTED.
+    assert len(error_calls) == 1
+    assert error_calls[0][0] == pipeline_run_id
+
+    # PipelineRunStarted, then PipelineRunErrored — cancellation didn't skip
+    # the terminal-event yield either.
+    assert len(yielded) == 2
+    assert isinstance(yielded[0], PipelineRunStarted)
+    assert isinstance(yielded[1], PipelineRunErrored)

@@ -1,0 +1,58 @@
+name: install_cognee
+description: "Installs Cognee from local source or PyPI depending on specified version"
+
+inputs:
+  python-version:
+    description: "Which Python version to use"
+    required: false
+    default: "3.11.x"
+  cognee_version:
+    description: "Pypi-compatible version of cognee to use. For example, 0.5.2.dev0. `local` (default) - Installing Cognee from local source"
+    required: false
+    default: "local"
+
+runs:
+  using: "composite"
+  steps:
+
+    - name: Detect CI container
+      id: detect-env
+      shell: bash
+      run: |
+        if [ -f "/app/.anon_id" ] && command -v uv &> /dev/null && [ -d "/app/.venv" ]; then
+          echo "in-container=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "in-container=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Set up Python
+      if: steps.detect-env.outputs.in-container != 'true'
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install uv
+      if: steps.detect-env.outputs.in-container != 'true'
+      uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4.2.0
+      with:
+        enable-cache: true
+
+    - name: (Re)Install Cognee
+      shell: bash
+      working-directory: cognee-mcp
+      env:
+        VIRTUAL_ENV: ${{ steps.detect-env.outputs.in-container == 'true' && '/app/.venv' || '' }}
+      run: |
+        uv pip uninstall cognee
+        if [ "${{ inputs.cognee_version }}" = "local" ]; then
+          echo "Installing Cognee from local source ..."
+          # --no-deps: the dependencies are already installed from uv.lock; a
+          # fresh resolution would upgrade them one package at a time past
+          # their locked, exactly-pinned partners (opentelemetry-api vs -sdk).
+          uv pip install --no-deps --force-reinstall -e ../
+        else
+          echo "Installing Cognee version ${{ inputs.cognee_version }} from PyPI..."
+          uv pip install --force-reinstall "cognee==${{ inputs.cognee_version }}"
+        fi
+        echo "Installed Cognee version:"
+        uv pip show cognee | grep Version

@@ -1,0 +1,99 @@
+name: LLM Test Suites
+
+permissions:
+  contents: read
+  packages: read
+
+on:
+  workflow_call:
+    inputs:
+      ci-image:
+        required: false
+        type: string
+        default: ''
+
+env:
+  RUNTIME__LOG_LEVEL: ERROR
+  ENV: 'dev'
+  COGNEE_SKIP_CONNECTION_TEST: 'true'
+
+jobs:
+  test-gemini:
+    name: Run Gemini Test
+    runs-on: ubuntu-22.04
+    container: ${{ inputs.ci-image != '' && fromJSON(format('{{"image":"{0}","credentials":{{"username":"{1}","password":"{2}"}}}}', inputs.ci-image, github.actor, github.token)) || null }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Cognee Setup
+        uses: ./.github/actions/cognee_setup
+        with:
+          python-version: '3.11.x'
+
+      - name: Run Gemini Simple Example
+        env:
+          LLM_PROVIDER: "gemini"
+          LLM_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          LLM_ARGS: ${{ secrets.LLM_ARGS }}
+          LLM_MODEL: "gemini/gemini-3-flash-preview"
+          EMBEDDING_PROVIDER: "gemini"
+          EMBEDDING_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          EMBEDDING_MODEL: "gemini/gemini-embedding-001"
+          EMBEDDING_DIMENSIONS: "768"
+          EMBEDDING_MAX_TOKENS: "8076"
+        run: uv run python ./examples/guides/simple_cognee_example.py
+
+  test-fastembed:
+    name: Run Fastembed Test
+    runs-on: ubuntu-22.04
+    container: ${{ inputs.ci-image != '' && fromJSON(format('{{"image":"{0}","credentials":{{"username":"{1}","password":"{2}"}}}}', inputs.ci-image, github.actor, github.token)) || null }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Cognee Setup
+        uses: ./.github/actions/cognee_setup
+        with:
+          python-version: '3.11.x'
+
+      - name: Run Fastembed Simple Example
+        env:
+          LLM_PROVIDER: "openai"
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_ARGS: ${{ secrets.LLM_ARGS }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
+          LLM_API_VERSION: ${{ secrets.LLM_API_VERSION }}
+          EMBEDDING_PROVIDER: "fastembed"
+          EMBEDDING_MODEL: "sentence-transformers/all-MiniLM-L6-v2"
+          EMBEDDING_DIMENSIONS: "384"
+          EMBEDDING_MAX_TOKENS: "256"
+        run: uv run python ./examples/guides/simple_cognee_example.py
+
+  test-claude-anthropic:
+    name: Run Anthropic Claude LLM Test
+    runs-on: ubuntu-22.04
+    container: ${{ inputs.ci-image != '' && fromJSON(format('{{"image":"{0}","credentials":{{"username":"{1}","password":"{2}"}}}}', inputs.ci-image, github.actor, github.token)) || null }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Cognee Setup
+        uses: ./.github/actions/cognee_setup
+        with:
+          python-version: '3.11.x'
+
+      - name: Run Claude Anthropic LLM Simple Example
+        env:
+          LLM_PROVIDER: "anthropic"
+          # Note: If model becomes outdated update docs with new model as well
+          LLM_MODEL: "anthropic/claude-sonnet-4-5-20250929"
+          LLM_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          LLM_ARGS: ${{ secrets.LLM_ARGS }}
+          LLM_MAX_TOKENS: "16384"
+          EMBEDDING_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          EMBEDDING_MODEL: "openai/text-embedding-3-large"
+          EMBEDDING_DIMENSIONS: "3072"
+          EMBEDDING_MAX_TOKENS: "8191"
+        run: uv run python ./examples/guides/simple_cognee_example.py

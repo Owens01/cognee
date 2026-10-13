@@ -1,0 +1,189 @@
+"""Tests for cache configuration."""
+
+import pytest
+
+from cognee.infrastructure.databases.cache.config import CacheConfig, get_cache_config
+
+
+def test_cache_config_defaults(monkeypatch):
+    """Test that CacheConfig has the correct default values."""
+    for env_var in (
+        "CACHE_BACKEND",
+        "CACHE_DB_URL",
+        "CACHE_PURGE_INTERVAL_SECONDS",
+        "CACHING",
+        "AUTO_FEEDBACK",
+        "SESSION_SEARCH_MODE",
+        "SHARED_LADYBUG_LOCK",
+        "SHARED_KUZU_LOCK",
+        "CACHE_HOST",
+        "CACHE_PORT",
+        "CACHE_USERNAME",
+        "CACHE_PASSWORD",
+        "CACHE_SSL",
+        "CACHE_SSL_CERT_REQS",
+        "AGENTIC_LOCK_EXPIRE",
+        "AGENTIC_LOCK_TIMEOUT",
+        "SESSION_TTL_SECONDS",
+        "USAGE_LOGGING",
+        "USAGE_LOGGING_TTL",
+    ):
+        monkeypatch.delenv(env_var, raising=False)
+
+    config = CacheConfig(_env_file=None)
+
+    assert config.cache_backend == "sqlite"
+    assert config.cache_db_url is None
+    assert config.cache_purge_interval_seconds == 900
+    assert config.caching is True
+    assert config.auto_feedback is True
+    assert config.session_search_mode == "concurrent"
+    assert config.shared_ladybug_lock is False
+    assert config.shared_kuzu_lock is False
+    assert config.cache_host == "localhost"
+    assert config.cache_port == 6379
+    assert config.cache_ssl is False
+    assert config.cache_ssl_cert_reqs == "required"
+    assert config.agentic_lock_expire == 240
+    assert config.agentic_lock_timeout == 300
+    assert config.session_ttl_seconds == 604800
+
+
+def test_cache_config_custom_values():
+    """Test that CacheConfig accepts custom values."""
+    config = CacheConfig(
+        cache_backend="redis",
+        caching=True,
+        session_search_mode="concurrent",
+        shared_ladybug_lock=True,
+        cache_host="redis.example.com",
+        cache_port=6380,
+        agentic_lock_expire=120,
+        agentic_lock_timeout=180,
+        session_ttl_seconds=3600,
+    )
+
+    assert config.cache_backend == "redis"
+    assert config.caching is True
+    assert config.session_search_mode == "concurrent"
+    assert config.shared_ladybug_lock is True
+    assert config.cache_host == "redis.example.com"
+    assert config.cache_port == 6380
+    assert config.agentic_lock_expire == 120
+    assert config.agentic_lock_timeout == 180
+    assert config.session_ttl_seconds == 3600
+
+
+def test_cache_config_to_dict():
+    """Test the to_dict method returns all configuration values."""
+    config = CacheConfig(
+        cache_backend="fs",
+        caching=True,
+        shared_ladybug_lock=True,
+        cache_host="test-host",
+        cache_port=7000,
+        agentic_lock_expire=100,
+        agentic_lock_timeout=200,
+        session_ttl_seconds=0,
+    )
+
+    config_dict = config.to_dict()
+
+    assert config_dict == {
+        "cache_backend": "fs",
+        "cache_db_url": None,
+        "cache_purge_interval_seconds": 900,
+        "caching": True,
+        "auto_feedback": True,
+        "session_search_mode": "concurrent",
+        "shared_ladybug_lock": True,
+        "shared_kuzu_lock": False,
+        "cache_host": "test-host",
+        "cache_port": 7000,
+        "cache_username": None,
+        "cache_password": None,
+        "cache_ssl": False,
+        "cache_ssl_cert_reqs": "required",
+        "agentic_lock_expire": 100,
+        "agentic_lock_timeout": 200,
+        "session_ttl_seconds": 0,
+        "max_session_context_chars": None,
+        "usage_logging": False,
+        "usage_logging_ttl": 604800,
+        "tapes_ingest_url": "http://localhost:8082",
+        "tapes_provider": "openai",
+        "tapes_agent_name": "cognee",
+        "tapes_model": "cognee-session",
+        "tapes_request_timeout": 5.0,
+    }
+
+
+def test_cache_config_session_ttl_none():
+    """Test that session_ttl_seconds accepts None to disable Redis session expiry."""
+    config = CacheConfig(session_ttl_seconds=None)
+
+    assert config.session_ttl_seconds is None
+    assert config.to_dict()["session_ttl_seconds"] is None
+
+
+def test_cache_config_ssl_from_env(monkeypatch):
+    """CACHE_SSL / CACHE_SSL_CERT_REQS enable TLS for managed Redis."""
+    monkeypatch.setenv("CACHE_SSL", "true")
+    monkeypatch.setenv("CACHE_SSL_CERT_REQS", "none")
+
+    config = CacheConfig(_env_file=None)
+
+    assert config.cache_ssl is True
+    assert config.cache_ssl_cert_reqs == "none"
+    assert config.to_dict()["cache_ssl"] is True
+    assert config.to_dict()["cache_ssl_cert_reqs"] == "none"
+
+
+def test_cache_config_session_search_mode_from_env(monkeypatch):
+    monkeypatch.setenv("SESSION_SEARCH_MODE", "sequential")
+
+    config = CacheConfig(_env_file=None)
+
+    assert config.session_search_mode == "sequential"
+
+
+def test_cache_config_rejects_invalid_session_search_mode():
+    with pytest.raises(ValueError):
+        CacheConfig(session_search_mode="fast")
+
+
+def test_get_cache_config_singleton():
+    """Test that get_cache_config returns the same instance."""
+    config1 = get_cache_config()
+    config2 = get_cache_config()
+
+    assert config1 is config2
+
+
+def test_cache_config_extra_fields_allowed():
+    """Test that CacheConfig allows extra fields due to extra='allow'."""
+    config = CacheConfig(extra_field="extra_value", another_field=123)
+
+    assert hasattr(config, "extra_field")
+    assert config.extra_field == "extra_value"
+    assert hasattr(config, "another_field")
+    assert config.another_field == 123
+
+
+def test_cache_config_boolean_type_validation():
+    """Test that boolean fields accept various truthy/falsy values."""
+    config1 = CacheConfig(caching="true", shared_ladybug_lock="yes")
+    assert config1.caching is True
+    assert config1.shared_ladybug_lock is True
+
+    config2 = CacheConfig(caching="false", shared_ladybug_lock="no")
+    assert config2.caching is False
+    assert config2.shared_ladybug_lock is False
+
+
+def test_cache_config_legacy_kuzu_lock_alias():
+    """Test that the legacy Kuzu lock setting still enables the Ladybug lock."""
+    config = CacheConfig(shared_kuzu_lock=True)
+
+    assert config.shared_kuzu_lock is True
+    assert config.shared_ladybug_lock is True

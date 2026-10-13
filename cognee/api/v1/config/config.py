@@ -1,0 +1,971 @@
+"""This module is used to set the configuration of the system."""
+
+import os
+
+from cognee.api.v1.exceptions.exceptions import InvalidConfigAttributeError
+from cognee.base_config import get_base_config
+from cognee.infrastructure.data.chunking.config import get_chunk_config
+from cognee.infrastructure.databases.graph.config import get_graph_config
+from cognee.infrastructure.databases.relational import get_migration_config, get_relational_config
+from cognee.infrastructure.databases.vector import get_vectordb_config
+from cognee.infrastructure.databases.vector.embeddings.config import get_embedding_config
+from cognee.infrastructure.llm.config import (
+    get_llm_config,
+)
+from cognee.modules.cognify.config import get_cognify_config
+from cognee.modules.recall.config import get_recall_config
+from cognee.tasks.translation.config import get_translation_config
+
+_BOOL_TRUE = {"true", "1", "yes", "on", "t", "y"}
+_BOOL_FALSE = {"false", "0", "no", "off", "f", "n", ""}
+
+
+def _coerce_bool(value, name: str) -> bool:
+    """Coerce ``value`` to ``bool``. Accepts bool, int, or a string of the
+    common truthy/falsy spellings. Used by setters that can be invoked from
+    the CLI (``cognee config set <key> <value>``), which always passes
+    strings.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _BOOL_TRUE:
+            return True
+        if normalized in _BOOL_FALSE:
+            return False
+    raise ValueError(f"{name} must be a bool or boolean-like string (true/false), got {value!r}")
+
+
+def _coerce_int(value, name: str, *, min_value: int | None = None) -> int:
+    """Coerce ``value`` to ``int``, optionally enforcing a minimum. Accepts
+    ints or strings of digits. Used by setters reachable via the CLI.
+    """
+    if isinstance(value, bool):
+        # ``bool`` is a subclass of ``int`` but semantically wrong here.
+        raise ValueError(f"{name} must be an integer, got bool {value!r}")
+    if isinstance(value, int):
+        result = value
+    elif isinstance(value, str):
+        try:
+            result = int(value)
+        except ValueError as exc:
+            raise ValueError(f"{name} must be an integer, got {value!r}") from exc
+    else:
+        raise ValueError(f"{name} must be an integer, got {type(value).__name__}")
+    if min_value is not None and result < min_value:
+        raise ValueError(f"{name} must be >= {min_value}, got {result}")
+    return result
+
+
+def _resolve_env_var_name(config_obj, key: str) -> str:
+    """Resolve the env var name pydantic-settings will read ``key`` back from.
+
+    Most fields have no alias, so the env var name is just ``key.upper()``.
+    A few (e.g. ``TranslationConfig.batch_size`` -> ``TRANSLATION_BATCH_SIZE``)
+    declare an explicit ``validation_alias``/``Field(..., env=...)`` that
+    diverges from that default — check for one before falling back.
+    """
+    fields = getattr(type(config_obj), "model_fields", None)
+    info = fields.get(key) if fields else None
+    alias = getattr(info, "validation_alias", None) if info else None
+    if isinstance(alias, str):
+        return alias
+    choices = getattr(alias, "choices", None)
+    if choices:
+        first = choices[0]
+        if isinstance(first, str):
+            return first
+    return key.upper()
+
+
+def _mask_secret(value: str) -> str:
+    """Mask a secret value for display, keeping a few edge characters as a hint."""
+    if not value:
+        return value
+    if len(value) <= 8:
+        return "*" * len(value)
+    return f"{value[:3]}...{value[-4:]}"
+
+
+def _persist_env_var(env_var_name: str, value) -> tuple[str, bool]:
+    """Write ``env_var_name=value`` into the ``.env`` this process loaded, or
+    into ``.env`` in the current working directory when none was loaded,
+    creating it if it doesn't exist yet.
+
+    Writing to the loaded file (``cognee.shared.env_file``) means a value
+    persisted here is picked up by the next process that resolves the same
+    file, including a pinned ``COGNEE_ENV_FILE`` or a ``.env`` found in a
+    parent directory. Returns ``(path, created)``.
+    """
+    import dotenv
+
+    from cognee.shared.env_file import load_env_file
+
+    path = load_env_file() or os.path.join(os.getcwd(), ".env")
+    created = not os.path.exists(path)
+    if created:
+        open(path, "a").close()
+    dotenv.set_key(path, env_var_name, "" if value is None else str(value))
+    return path, created
+
+
+def _coerce_float(value, name: str, *, min_value: float | None = None) -> float:
+    """Coerce ``value`` to ``float``, optionally enforcing a minimum. Accepts
+    ints, floats, or numeric strings. Used by setters reachable via the CLI.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a number, got bool {value!r}")
+    if isinstance(value, (int, float)):
+        result = float(value)
+    elif isinstance(value, str):
+        try:
+            result = float(value)
+        except ValueError as exc:
+            raise ValueError(f"{name} must be a number, got {value!r}") from exc
+    else:
+        raise ValueError(f"{name} must be a number, got {type(value).__name__}")
+    if min_value is not None and result < min_value:
+        raise ValueError(f"{name} must be >= {min_value}, got {result}")
+    return result
+
+
+def _coerce_for_field(config_obj, key: str, value):
+    """Coerce ``value`` to the declared type of ``config_obj.<key>`` for the
+    common ``bool`` and ``int`` cases. Used by ``_update_config`` so bulk
+    setters (``set_graph_db_config(...)`` etc.) accept the same string
+    payloads the CLI-targeted single-key setters do — without this, a
+    payload like ``{"graph_database_subprocess_enabled": "true"}`` would
+    persist as the string ``"true"`` and break ``if subprocess_enabled:``
+    downstream.
+
+    Other annotated types pass through unchanged. Non-pydantic models also
+    pass through (``model_fields`` is missing).
+    """
+    import typing
+
+    fields = getattr(type(config_obj), "model_fields", None)
+    if fields is None:
+        return value
+    info = fields.get(key)
+    if info is None:
+        return value
+    annotation = info.annotation
+    # Unwrap ``Optional[X]`` / ``X | None``.
+    args = typing.get_args(annotation)
+    if args:
+        non_none = [a for a in args if a is not type(None)]
+        if len(non_none) == 1:
+            annotation = non_none[0]
+    if annotation is bool:
+        return _coerce_bool(value, key)
+    if annotation is int:
+        return _coerce_int(value, key)
+    if annotation is float:
+        return _coerce_float(value, key)
+    return value
+
+
+class config:
+    """
+    Configuration namespace for Cognee's runtime settings.
+
+    All methods are static and configure LLM providers, embedding providers,
+    database backends, chunking strategies, and storage paths at runtime
+    without requiring environment variable changes.
+
+    Example:
+        ```python
+        import cognee
+
+        cognee.config.set_llm_api_key("your-api-key")
+        cognee.config.set_llm_model("gpt-4o-mini")
+        cognee.config.set_embedding_provider("fastembed")
+        cognee.config.set_embedding_model("BAAI/bge-small-en-v1.5")
+        cognee.config.set_embedding_dimensions(384)
+        cognee.config.system_root_directory("/path/to/system")
+        cognee.config.set_vector_db_provider("lancedb")
+        ```
+    """
+
+    @staticmethod
+    def system_root_directory(system_root_directory: str):
+        """Set the system root directory and update dependent database paths.
+
+        Configures the base system directory and cascades the change to
+        relational, graph, and vector database path configurations.
+
+        Parameters
+        ----------
+        system_root_directory : str
+            Absolute path to the system root directory.
+        """
+        base_config = get_base_config()
+        base_config.system_root_directory = system_root_directory
+
+        databases_directory_path = os.path.join(base_config.system_root_directory, "databases")
+
+        relational_config = get_relational_config()
+        relational_config.db_path = databases_directory_path
+
+        graph_config = get_graph_config()
+        graph_file_name = graph_config.graph_filename
+        graph_config.graph_file_path = os.path.join(databases_directory_path, graph_file_name)
+
+        vector_config = get_vectordb_config()
+        if vector_config.vector_db_provider == "lancedb":
+            vector_config.vector_db_url = os.path.join(databases_directory_path, "cognee.lancedb")
+
+    @staticmethod
+    def data_root_directory(data_root_directory: str):
+        """Set the data root directory for storing ingested data.
+
+        Parameters
+        ----------
+        data_root_directory : str
+            Absolute path to the data root directory.
+        """
+        base_config = get_base_config()
+        base_config.data_root_directory = data_root_directory
+
+    @staticmethod
+    def monitoring_tool(monitoring_tool: object):
+        """Set the monitoring tool for observability.
+
+        Parameters
+        ----------
+        monitoring_tool : object
+            A monitoring tool instance.
+        """
+        base_config = get_base_config()
+        base_config.monitoring_tool = monitoring_tool
+
+    @staticmethod
+    def set_classification_model(classification_model: object):
+        """Set the model used for classification during cognification.
+
+        Parameters
+        ----------
+        classification_model : object
+            The classification model to use.
+        """
+        cognify_config = get_cognify_config()
+        cognify_config.classification_model = classification_model
+
+    @staticmethod
+    def set_summarization_model(summarization_model: object):
+        """Set the model used for summarization during cognification.
+
+        Parameters
+        ----------
+        summarization_model : object
+            The summarization model to use.
+        """
+        cognify_config = get_cognify_config()
+        cognify_config.summarization_model = summarization_model
+
+    @staticmethod
+    def set_graph_model(graph_model: object):
+        """Set the model used for graph extraction.
+
+        Parameters
+        ----------
+        graph_model : object
+            The graph extraction model to use.
+        """
+        graph_config = get_graph_config()
+        graph_config.graph_model = graph_model
+
+    @staticmethod
+    def set_graph_database_provider(graph_database_provider: str):
+        """Set the graph database provider.
+
+        Parameters
+        ----------
+        graph_database_provider : str
+            The graph database provider name (e.g. 'networkx', 'neo4j').
+        """
+        graph_config = get_graph_config()
+        graph_config.graph_database_provider = graph_database_provider
+
+    @staticmethod
+    def set_graph_database_subprocess_enabled(graph_database_subprocess_enabled):
+        """Enable the subprocess-backed graph DB adapter.
+
+        When enabled, the native Kuzu client runs in a dedicated worker
+        process so its memory and file-lock state are isolated from the main
+        cognee process. Required for long-running services that otherwise
+        accumulate native memory in the embedded Kuzu engine.
+
+        Accepts a ``bool`` or a truthy/falsy string (``"true"``/``"false"``,
+        ``"1"``/``"0"``, ``"yes"``/``"no"``) — the generic ``config.set()``
+        path is used by the CLI, which can only pass strings.
+        """
+        graph_config = get_graph_config()
+        graph_config.graph_database_subprocess_enabled = _coerce_bool(
+            graph_database_subprocess_enabled,
+            "graph_database_subprocess_enabled",
+        )
+
+    @staticmethod
+    def set_kuzu_num_threads(kuzu_num_threads):
+        """Set the maximum number of threads Kuzu uses per query.
+
+        ``0`` keeps Kuzu's internal default (one per CPU). Accepts ``int``
+        or a string of digits; the CLI path (``config set``) always passes
+        strings.
+        """
+        graph_config = get_graph_config()
+        graph_config.kuzu_num_threads = _coerce_int(
+            kuzu_num_threads, "kuzu_num_threads", min_value=0
+        )
+
+    @staticmethod
+    def set_kuzu_buffer_pool_size(kuzu_buffer_pool_size):
+        """Set the Kuzu buffer pool size in bytes.
+
+        Accepts ``int`` or a string of digits; the CLI path (``config set``)
+        always passes strings.
+        """
+        graph_config = get_graph_config()
+        graph_config.kuzu_buffer_pool_size = _coerce_int(
+            kuzu_buffer_pool_size, "kuzu_buffer_pool_size", min_value=1
+        )
+
+    @staticmethod
+    def set_kuzu_max_db_size(kuzu_max_db_size):
+        """Set the Kuzu maximum on-disk database size in bytes.
+
+        Accepts ``int`` or a string of digits; the CLI path (``config set``)
+        always passes strings. Defaults to 4 GB; raise this for large graphs.
+        """
+        graph_config = get_graph_config()
+        graph_config.kuzu_max_db_size = _coerce_int(
+            kuzu_max_db_size, "kuzu_max_db_size", min_value=1
+        )
+
+    @staticmethod
+    def set_llm_provider(llm_provider: str):
+        """Set the LLM provider.
+
+        Parameters
+        ----------
+        llm_provider : str
+            The LLM provider name (e.g. 'openai', 'anthropic', 'litellm').
+        """
+        llm_config = get_llm_config()
+        llm_config.llm_provider = llm_provider
+
+    @staticmethod
+    def set_llm_endpoint(llm_endpoint: str):
+        """Set a custom LLM API endpoint URL.
+
+        Parameters
+        ----------
+        llm_endpoint : str
+            The base URL for the LLM API.
+        """
+        llm_config = get_llm_config()
+        llm_config.llm_endpoint = llm_endpoint
+
+    @staticmethod
+    def set_llm_model(llm_model: str):
+        """Set the LLM model name.
+
+        Parameters
+        ----------
+        llm_model : str
+            The model identifier (e.g. 'gpt-4o-mini', 'claude-3-sonnet').
+        """
+        llm_config = get_llm_config()
+        llm_config.llm_model = llm_model
+
+    @staticmethod
+    def set_llm_api_key(llm_api_key: str):
+        """Set the API key for the LLM provider.
+
+        Parameters
+        ----------
+        llm_api_key : str
+            The API key string.
+        """
+        llm_config = get_llm_config()
+        llm_config.llm_api_key = llm_api_key
+
+    @staticmethod
+    def _update_config(config_obj, config_dict: dict):
+        """Update a config object with values from a dictionary after attribute validation.
+
+        Parameters
+        ----------
+        config_obj : object
+            The configuration object to update.
+        config_dict : dict
+            A dictionary of attribute names to new values.
+
+        Returns
+        -------
+        object
+            The updated configuration object.
+
+        Raises
+        ------
+        InvalidConfigAttributeError
+            If any key in config_dict is not a valid attribute of config_obj.
+        """
+        for key, value in config_dict.items():
+            if hasattr(config_obj, key):
+                # Coerce stringy values to the field's declared bool/int
+                # type so payloads coming from the CLI / generic dispatch
+                # land with the right runtime types — same contract as the
+                # single-key setters (``set_graph_database_subprocess_enabled``
+                # etc.) which accept ``"true"`` / ``"4"`` and parse them.
+                coerced = _coerce_for_field(config_obj, key, value)
+                object.__setattr__(config_obj, key, coerced)
+            else:
+                raise InvalidConfigAttributeError(attribute=key)
+
+        return config_obj
+
+    @staticmethod
+    def set_llm_config(config_dict: dict):
+        """Update the LLM config with values from a dictionary.
+
+        Parameters
+        ----------
+        config_dict : dict
+            A dictionary of LLM config attributes to update.
+        """
+        config._update_config(get_llm_config(), config_dict)
+
+    # Embedding configuration methods
+
+    @staticmethod
+    def set_embedding_provider(embedding_provider: str):
+        """Set the embedding provider.
+
+        Parameters
+        ----------
+        embedding_provider : str
+            The embedding provider name (e.g. 'openai', 'fastembed', 'azure', 'litellm').
+        """
+        embedding_config = get_embedding_config()
+        embedding_config.embedding_provider = embedding_provider
+
+    @staticmethod
+    def set_embedding_model(embedding_model: str):
+        """Set the embedding model name.
+
+        Parameters
+        ----------
+        embedding_model : str
+            The model identifier (e.g. 'openai/text-embedding-3-large', 'BAAI/bge-small-en-v1.5').
+        """
+        embedding_config = get_embedding_config()
+        embedding_config.embedding_model = embedding_model
+
+    @staticmethod
+    def set_embedding_dimensions(embedding_dimensions: int):
+        """Set the embedding vector dimensions.
+
+        Coerces string inputs to int for CLI compatibility and validates
+        the value is a positive integer.
+
+        Parameters
+        ----------
+        embedding_dimensions : int
+            The number of dimensions for embedding vectors
+            (e.g. 3072 for text-embedding-3-large, 384 for bge-small-en-v1.5).
+
+        Raises
+        ------
+        ValueError
+            If the value cannot be converted to an integer or is not positive.
+        """
+        if isinstance(embedding_dimensions, str):
+            try:
+                embedding_dimensions = int(embedding_dimensions)
+            except ValueError as exc:
+                raise ValueError("embedding_dimensions must be a positive integer.") from exc
+        if embedding_dimensions <= 0:
+            raise ValueError("embedding_dimensions must be a positive integer.")
+        embedding_config = get_embedding_config()
+        embedding_config.embedding_dimensions = embedding_dimensions
+
+    @staticmethod
+    def set_embedding_endpoint(embedding_endpoint: str):
+        """Set a custom embedding API endpoint URL.
+
+        Parameters
+        ----------
+        embedding_endpoint : str
+            The base URL for the embedding API.
+        """
+        embedding_config = get_embedding_config()
+        embedding_config.embedding_endpoint = embedding_endpoint
+
+    @staticmethod
+    def set_embedding_api_key(embedding_api_key: str):
+        """Set the API key for the embedding provider.
+
+        Parameters
+        ----------
+        embedding_api_key : str
+            The API key string.
+        """
+        embedding_config = get_embedding_config()
+        embedding_config.embedding_api_key = embedding_api_key
+
+    @staticmethod
+    def set_embedding_config(config_dict: dict):
+        """Update the embedding config with values from a dictionary.
+
+        Routes embedding_dimensions through set_embedding_dimensions to ensure
+        type coercion and positive-value validation are applied.
+
+        Parameters
+        ----------
+        config_dict : dict
+            A dictionary of embedding config attributes to update.
+            Valid keys include: embedding_provider, embedding_model,
+            embedding_dimensions, embedding_endpoint, embedding_api_key,
+            embedding_api_version, embedding_max_completion_tokens,
+            embedding_batch_size, embedding_max_concurrent_data_points,
+            huggingface_tokenizer.
+
+        Example
+        -------
+            ```python
+            cognee.config.set_embedding_config({
+                "embedding_provider": "fastembed",
+                "embedding_model": "BAAI/bge-small-en-v1.5",
+                "embedding_dimensions": 384,
+            })
+            ```
+        """
+        normalized_config = dict(config_dict)
+        if "embedding_dimensions" in normalized_config:
+            config.set_embedding_dimensions(normalized_config.pop("embedding_dimensions"))
+        config._update_config(get_embedding_config(), normalized_config)
+
+    @staticmethod
+    def set_chunk_strategy(chunk_strategy: object):
+        """Set the chunking strategy.
+
+        Parameters
+        ----------
+        chunk_strategy : object
+            The chunking strategy to use.
+        """
+        chunk_config = get_chunk_config()
+        chunk_config.chunk_strategy = chunk_strategy
+
+    @staticmethod
+    def set_chunk_engine(chunk_engine: object):
+        """Set the chunking engine.
+
+        Parameters
+        ----------
+        chunk_engine : object
+            The chunking engine to use.
+        """
+        chunk_config = get_chunk_config()
+        chunk_config.chunk_engine = chunk_engine
+
+    @staticmethod
+    def set_chunk_overlap(chunk_overlap: object):
+        """Set the chunk overlap size.
+
+        Parameters
+        ----------
+        chunk_overlap : object
+            The number of overlapping tokens/characters between chunks.
+        """
+        chunk_config = get_chunk_config()
+        chunk_config.chunk_overlap = chunk_overlap
+
+    @staticmethod
+    def set_chunk_size(chunk_size: object):
+        """Set the chunk size.
+
+        Parameters
+        ----------
+        chunk_size : object
+            The target size for each chunk.
+        """
+        chunk_config = get_chunk_config()
+        chunk_config.chunk_size = chunk_size
+
+    @staticmethod
+    def set_vector_db_provider(vector_db_provider: str):
+        """Set the vector database provider.
+
+        Parameters
+        ----------
+        vector_db_provider : str
+            The vector database provider name (e.g. 'lancedb', 'pgvector'). Additional
+            providers (e.g. 'chromadb', 'qdrant') are available as community adapters.
+        """
+        vector_db_config = get_vectordb_config()
+        vector_db_config.vector_db_provider = vector_db_provider
+
+    @staticmethod
+    def set_vector_db_subprocess_enabled(vector_db_subprocess_enabled):
+        """Enable the subprocess-backed vector DB adapter (LanceDB).
+
+        When enabled, the native LanceDB client runs in a dedicated worker
+        process so its memory and file state are isolated from the main
+        cognee process. Accepts a ``bool`` or a truthy/falsy string; the
+        generic ``config.set()`` path is used by the CLI which only passes
+        strings.
+        """
+        vector_db_config = get_vectordb_config()
+        vector_db_config.vector_db_subprocess_enabled = _coerce_bool(
+            vector_db_subprocess_enabled, "vector_db_subprocess_enabled"
+        )
+
+    @staticmethod
+    def set_relational_db_config(config_dict: dict):
+        """Update the relational database config with values from a dictionary.
+
+        Parameters
+        ----------
+        config_dict : dict
+            A dictionary of relational DB config attributes to update.
+        """
+        config._update_config(get_relational_config(), config_dict)
+
+    @staticmethod
+    def set_migration_db_config(config_dict: dict):
+        """Update the migration database config with values from a dictionary.
+
+        Parameters
+        ----------
+        config_dict : dict
+            A dictionary of migration DB config attributes to update.
+        """
+        config._update_config(get_migration_config(), config_dict)
+
+    @staticmethod
+    def set_graph_db_config(config_dict: dict) -> None:
+        """Update the graph database config with values from a dictionary.
+
+        Parameters
+        ----------
+        config_dict : dict
+            A dictionary of graph DB config attributes to update.
+        """
+        config._update_config(get_graph_config(), config_dict)
+
+    @staticmethod
+    def set_vector_db_config(config_dict: dict):
+        """Update the vector database config with values from a dictionary.
+
+        Parameters
+        ----------
+        config_dict : dict
+            A dictionary of vector DB config attributes to update.
+        """
+        config._update_config(get_vectordb_config(), config_dict)
+
+    @staticmethod
+    def set_vector_db_key(db_key: str):
+        """Set the API key for the vector database provider.
+
+        Parameters
+        ----------
+        db_key : str
+            The API key string.
+        """
+        vector_db_config = get_vectordb_config()
+        vector_db_config.vector_db_key = db_key
+
+    @staticmethod
+    def set_vector_db_url(db_url: str):
+        """Set the URL for the vector database.
+
+        Parameters
+        ----------
+        db_url : str
+            The database URL.
+        """
+        vector_db_config = get_vectordb_config()
+        vector_db_config.vector_db_url = db_url
+
+    # Translation configuration methods
+
+    @staticmethod
+    def set_translation_provider(provider: str):
+        """Set the translation provider.
+
+        Parameters
+        ----------
+        provider : str
+            The translation provider name (e.g. 'llm', 'google', 'azure').
+        """
+        translation_config = get_translation_config()
+        translation_config.translation_provider = provider
+
+    @staticmethod
+    def set_translation_target_language(target_language: str):
+        """Set the default target language for translations.
+
+        Parameters
+        ----------
+        target_language : str
+            The target language code (e.g. 'en', 'es', 'fr').
+        """
+        translation_config = get_translation_config()
+        translation_config.target_language = target_language
+
+    @staticmethod
+    def set_translation_config(config_dict: dict):
+        """Update the translation config with values from a dictionary.
+
+        Parameters
+        ----------
+        config_dict : dict
+            A dictionary of translation config attributes to update.
+        """
+        config._update_config(get_translation_config(), config_dict)
+
+    # Recall configuration methods
+
+    @staticmethod
+    def set_recall_warmup_shortcircuit(recall_warmup_shortcircuit):
+        """Enable/disable the recall graph-lane warm-up short-circuit.
+
+        Enabled by default: recalls against datasets whose knowledge graph
+        has never been built return an instant "memory warming up" marker
+        instead of running graph search plus an LLM call.
+
+        Parameters
+        ----------
+        recall_warmup_shortcircuit : bool | str
+            True/False, or a boolean-like string when set via the CLI.
+        """
+        recall_config = get_recall_config()
+        recall_config.recall_warmup_shortcircuit = _coerce_bool(
+            recall_warmup_shortcircuit, "recall_warmup_shortcircuit"
+        )
+
+    @staticmethod
+    def set_recall_warmup_threshold(recall_warmup_threshold):
+        """Set the minimum datapoint count considered "warm" (default 1).
+
+        Parameters
+        ----------
+        recall_warmup_threshold : int | str
+            Minimum count; values above the probe's cap are clamped.
+        """
+        recall_config = get_recall_config()
+        recall_config.recall_warmup_threshold = _coerce_int(
+            recall_warmup_threshold, "recall_warmup_threshold", min_value=1
+        )
+
+    @staticmethod
+    def set_recall_warmup_cache_ttl(recall_warmup_cache_ttl):
+        """Set how long (seconds) a warm verdict is cached in-process.
+
+        Parameters
+        ----------
+        recall_warmup_cache_ttl : float | str
+            TTL in seconds (default 60).
+        """
+        recall_config = get_recall_config()
+        recall_config.recall_warmup_cache_ttl = _coerce_float(
+            recall_warmup_cache_ttl, "recall_warmup_cache_ttl", min_value=0.0
+        )
+
+    @staticmethod
+    def set_recall_config(config_dict: dict):
+        """Update the recall config with values from a dictionary.
+
+        Parameters
+        ----------
+        config_dict : dict
+            A dictionary of recall config attributes to update.
+        """
+        config._update_config(get_recall_config(), config_dict)
+
+    # Map configuration keys to their setter methods. Used by ``set()``.
+    _setter_mapping = {
+        "llm_provider": "set_llm_provider",
+        "llm_model": "set_llm_model",
+        "llm_api_key": "set_llm_api_key",
+        "llm_endpoint": "set_llm_endpoint",
+        "embedding_provider": "set_embedding_provider",
+        "embedding_model": "set_embedding_model",
+        "embedding_dimensions": "set_embedding_dimensions",
+        "embedding_endpoint": "set_embedding_endpoint",
+        "embedding_api_key": "set_embedding_api_key",
+        "graph_database_provider": "set_graph_database_provider",
+        "graph_database_subprocess_enabled": "set_graph_database_subprocess_enabled",
+        "kuzu_num_threads": "set_kuzu_num_threads",
+        "kuzu_buffer_pool_size": "set_kuzu_buffer_pool_size",
+        "kuzu_max_db_size": "set_kuzu_max_db_size",
+        "vector_db_provider": "set_vector_db_provider",
+        "vector_db_subprocess_enabled": "set_vector_db_subprocess_enabled",
+        "vector_db_url": "set_vector_db_url",
+        "vector_db_key": "set_vector_db_key",
+        "chunk_size": "set_chunk_size",
+        "chunk_overlap": "set_chunk_overlap",
+        "chunk_strategy": "set_chunk_strategy",
+        "chunk_engine": "set_chunk_engine",
+        "classification_model": "set_classification_model",
+        "summarization_model": "set_summarization_model",
+        "graph_model": "set_graph_model",
+        "recall_warmup_shortcircuit": "set_recall_warmup_shortcircuit",
+        "recall_warmup_threshold": "set_recall_warmup_threshold",
+        "recall_warmup_cache_ttl": "set_recall_warmup_cache_ttl",
+        "system_root_directory": "system_root_directory",
+        "data_root_directory": "data_root_directory",
+    }
+
+    # Mirrors ``_setter_mapping`` for reads: key -> (config getter, attribute name).
+    # Used by ``get()``/``get_all()``.
+    _getter_mapping = {
+        "llm_provider": (get_llm_config, "llm_provider"),
+        "llm_model": (get_llm_config, "llm_model"),
+        "llm_api_key": (get_llm_config, "llm_api_key"),
+        "llm_endpoint": (get_llm_config, "llm_endpoint"),
+        "embedding_provider": (get_embedding_config, "embedding_provider"),
+        "embedding_model": (get_embedding_config, "embedding_model"),
+        "embedding_dimensions": (get_embedding_config, "embedding_dimensions"),
+        "embedding_endpoint": (get_embedding_config, "embedding_endpoint"),
+        "embedding_api_key": (get_embedding_config, "embedding_api_key"),
+        "graph_database_provider": (get_graph_config, "graph_database_provider"),
+        "graph_database_subprocess_enabled": (
+            get_graph_config,
+            "graph_database_subprocess_enabled",
+        ),
+        "kuzu_num_threads": (get_graph_config, "kuzu_num_threads"),
+        "kuzu_buffer_pool_size": (get_graph_config, "kuzu_buffer_pool_size"),
+        "kuzu_max_db_size": (get_graph_config, "kuzu_max_db_size"),
+        "vector_db_provider": (get_vectordb_config, "vector_db_provider"),
+        "vector_db_subprocess_enabled": (get_vectordb_config, "vector_db_subprocess_enabled"),
+        "vector_db_url": (get_vectordb_config, "vector_db_url"),
+        "vector_db_key": (get_vectordb_config, "vector_db_key"),
+        "chunk_size": (get_chunk_config, "chunk_size"),
+        "chunk_overlap": (get_chunk_config, "chunk_overlap"),
+        "chunk_strategy": (get_chunk_config, "chunk_strategy"),
+        "chunk_engine": (get_chunk_config, "chunk_engine"),
+        "classification_model": (get_cognify_config, "classification_model"),
+        "summarization_model": (get_cognify_config, "summarization_model"),
+        "graph_model": (get_graph_config, "graph_model"),
+        "recall_warmup_shortcircuit": (get_recall_config, "recall_warmup_shortcircuit"),
+        "recall_warmup_threshold": (get_recall_config, "recall_warmup_threshold"),
+        "recall_warmup_cache_ttl": (get_recall_config, "recall_warmup_cache_ttl"),
+        "system_root_directory": (get_base_config, "system_root_directory"),
+        "data_root_directory": (get_base_config, "data_root_directory"),
+    }
+
+    # Keys whose value is a secret and should be masked by ``get``/``get_all``
+    # unless the caller explicitly asks to reveal it.
+    _secret_keys = {"llm_api_key", "embedding_api_key", "vector_db_key"}
+
+    @staticmethod
+    def get(key: str, reveal_secrets: bool = False):
+        """Get a configuration value by key name.
+
+        Parameters
+        ----------
+        key : str
+            The configuration key name (same names accepted by ``set()``).
+        reveal_secrets : bool
+            If False (default), secret values (API keys) are masked.
+
+        Raises
+        ------
+        InvalidConfigAttributeError
+            If the key is not a recognized configuration attribute.
+        """
+        if key in config._getter_mapping:
+            getter, attribute = config._getter_mapping[key]
+            value = getattr(getter(), attribute)
+        else:
+            embedding_config = get_embedding_config()
+            if not hasattr(embedding_config, key):
+                raise InvalidConfigAttributeError(attribute=key)
+            value = getattr(embedding_config, key)
+
+        if key in config._secret_keys and value and not reveal_secrets:
+            return _mask_secret(str(value))
+        return value
+
+    @staticmethod
+    def get_all(reveal_secrets: bool = False) -> dict:
+        """Get all known configuration values.
+
+        Parameters
+        ----------
+        reveal_secrets : bool
+            If False (default), secret values (API keys) are masked.
+        """
+        keys = list(config._getter_mapping.keys())
+        for field_name in type(get_embedding_config()).model_fields:
+            if field_name not in config._getter_mapping:
+                keys.append(field_name)
+
+        return {key: config.get(key, reveal_secrets=reveal_secrets) for key in keys}
+
+    @staticmethod
+    def set(key: str, value, persist: bool = False):
+        """Set a configuration value by key name.
+
+        Generic setter that maps configuration keys to their specific setter methods.
+        This enables CLI commands like 'cognee config set llm_api_key <value>'.
+
+        For embedding keys not explicitly listed in the mapping but present on
+        EmbeddingConfig, the value is routed through set_embedding_config as a
+        fallback so that all valid embedding attributes are accessible via CLI.
+
+        Parameters
+        ----------
+        key : str
+            The configuration key name.
+        value : any
+            The value to set.
+        persist : bool
+            If True, also write the resulting value to the ``.env`` file in the
+            current working directory, so it survives past the current process
+            (used by the CLI; SDK callers default to the previous in-memory-only
+            behavior).
+
+        Returns
+        -------
+        dict or None
+            When ``persist`` is True, ``{"path": ..., "created": ..., "env_var": ...}``
+            describing where the value was written. ``None`` otherwise.
+
+        Raises
+        ------
+        InvalidConfigAttributeError
+            If the key is not a recognized configuration attribute.
+        """
+        if key in config._setter_mapping:
+            method_name = config._setter_mapping[key]
+            method = getattr(config, method_name)
+            method(value)
+        else:
+            embedding_config = get_embedding_config()
+            if not hasattr(embedding_config, key):
+                raise InvalidConfigAttributeError(attribute=key)
+            config.set_embedding_config({key: value})
+
+        if not persist:
+            return None
+
+        if key in config._getter_mapping:
+            getter, attribute = config._getter_mapping[key]
+            config_obj = getter()
+        else:
+            config_obj = get_embedding_config()
+            attribute = key
+        final_value = getattr(config_obj, attribute)
+
+        env_var_name = _resolve_env_var_name(config_obj, attribute)
+        path, created = _persist_env_var(env_var_name, final_value)
+        return {"path": path, "created": created, "env_var": env_var_name}

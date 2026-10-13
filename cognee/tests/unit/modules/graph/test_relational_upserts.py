@@ -1,0 +1,209 @@
+from datetime import datetime, timezone
+from importlib import import_module
+from unittest.mock import AsyncMock, patch
+from uuid import UUID, uuid4
+
+import pytest
+from sqlalchemy import create_engine, select, text
+from sqlalchemy.orm import Session
+
+from cognee.infrastructure.engine import DataPoint
+from cognee.modules.graph.methods.sanitize_relational_payload import sanitize_relational_payload
+from cognee.modules.graph.methods.upsert_edges import upsert_edges
+from cognee.modules.graph.methods.upsert_nodes import upsert_nodes
+from cognee.modules.graph.models import Edge
+
+upsert_nodes_module = import_module("cognee.modules.graph.methods.upsert_nodes")
+upsert_edges_module = import_module("cognee.modules.graph.methods.upsert_edges")
+
+NUMERIC_LOOKING_UUID = UUID("123e4567890123456789012345678901")
+
+
+class RelationalPoint(DataPoint):
+    name: str
+    text: str
+    details: dict
+    metadata: dict = {"index_fields": ["text"]}
+
+
+class FakeInsertStatement:
+    def __init__(self):
+        self.values_arg = None
+        self.index_elements = None
+
+    def values(self, value):
+        self.values_arg = value
+        return self
+
+    def on_conflict_do_nothing(self, index_elements):
+        self.index_elements = index_elements
+        return self
+
+
+def test_edge_uuid_columns_keep_numeric_looking_values_as_text_in_sqlite():
+    engine = create_engine("sqlite://")
+    Edge.__table__.create(engine)
+
+    edge = Edge(
+        id=NUMERIC_LOOKING_UUID,
+        slug=uuid4(),
+        user_id=uuid4(),
+        data_id=uuid4(),
+        dataset_id=uuid4(),
+        source_node_id=uuid4(),
+        destination_node_id=uuid4(),
+        relationship_name="contains",
+        created_at=datetime.now(timezone.utc),
+    )
+
+    with Session(engine) as session:
+        session.add(edge)
+        session.commit()
+        session.expire_all()
+        stored_edge = session.scalar(select(Edge).where(Edge.id == NUMERIC_LOOKING_UUID))
+
+    with engine.connect() as connection:
+        table_sql = connection.scalar(
+            text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'edges'")
+        )
+        storage_type = connection.scalar(text("SELECT typeof(id) FROM edges"))
+
+    assert "CHAR(32)" in table_sql
+    assert storage_type == "text"
+    assert stored_edge.id == NUMERIC_LOOKING_UUID
+
+
+def test_sanitize_relational_payload_strips_null_bytes_recursively():
+    payload = {
+        "ti\x00tle": "hel\x00lo",
+        "nested": ["wo\x00rld", {"ke\x00y": "va\x00lue"}],
+        "tupled": ("a\x00", 1),
+    }
+
+    assert sanitize_relational_payload(payload) == {
+        "title": "hello",
+        "nested": ["world", {"key": "value"}],
+        "tupled": ("a", 1),
+    }
+
+
+def test_sanitize_relational_payload_decodes_bytes_and_bytearray():
+    payload = {
+        "bytes": b"hel\x00lo",
+        "bytearray": bytearray(b"wo\x00rld"),
+        "invalid": b"\xff\x00",
+    }
+
+    assert sanitize_relational_payload(payload) == {
+        "bytes": "hello",
+        "bytearray": "world",
+        "invalid": "\ufffd",
+    }
+
+
+@pytest.mark.asyncio
+async def test_upsert_nodes_sanitizes_strings_before_insert():
+    point = RelationalPoint(
+        name="Doc\x00ument",
+        text="Bad\x00 text",
+        details={"summa\x00ry": "Nested\x00 value", "items": ["A\x00", "B"]},
+    )
+    session = AsyncMock()
+    statement = FakeInsertStatement()
+
+    with patch.object(upsert_nodes_module, "insert", return_value=statement):
+        await upsert_nodes(
+            [point],
+            tenant_id=uuid4(),
+            user_id=uuid4(),
+            dataset_id=uuid4(),
+            data_id=uuid4(),
+            session=session,
+        )
+
+    payload = statement.values_arg[0]
+    assert payload["type"] == "RelationalPoint"
+    assert payload["indexed_fields"] == ["text"]
+    assert payload["label"] == "Document"
+    assert payload["attributes"]["name"] == "Document"
+    assert payload["attributes"]["text"] == "Bad text"
+    assert payload["attributes"]["details"] == {"summary": "Nested value", "items": ["A", "B"]}
+    session.execute.assert_awaited_once_with(statement)
+    session.commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_upsert_edges_sanitizes_strings_before_insert():
+    source_id = uuid4()
+    target_id = uuid4()
+    session = AsyncMock()
+    statement = FakeInsertStatement()
+    edge = (
+        source_id,
+        target_id,
+        "rel\x00ates",
+        {
+            "edge_text": "des\x00cribes",
+            "no\x00te": "nul\x00 byte",
+            "nested": {"va\x00lue": "still\x00 here"},
+        },
+    )
+
+    with patch.object(upsert_edges_module, "insert", return_value=statement):
+        await upsert_edges(
+            [edge],
+            tenant_id=uuid4(),
+            user_id=uuid4(),
+            dataset_id=uuid4(),
+            data_id=uuid4(),
+            session=session,
+        )
+
+    payload = statement.values_arg[0]
+    assert payload["relationship_name"] == "relates"
+    assert payload["label"] == "relates"
+    assert payload["attributes"] == {
+        "edge_text": "describes",
+        "note": "nul byte",
+        "nested": {"value": "still here"},
+    }
+    session.execute.assert_awaited_once_with(statement)
+    session.commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_upsert_edges_sanitizes_contains_edge_text_before_insert():
+    source_id = uuid4()
+    target_id = uuid4()
+    session = AsyncMock()
+    statement = FakeInsertStatement()
+    edge = (
+        source_id,
+        target_id,
+        "contains",
+        {
+            "edge_text": "Document chunk mentions Ali\x00ce: bad\x00 text",
+            "no\x00te": "nul\x00 byte",
+        },
+    )
+
+    with patch.object(upsert_edges_module, "insert", return_value=statement):
+        await upsert_edges(
+            [edge],
+            tenant_id=uuid4(),
+            user_id=uuid4(),
+            dataset_id=uuid4(),
+            data_id=uuid4(),
+            session=session,
+        )
+
+    payload = statement.values_arg[0]
+    expected_relationship_name = "Document chunk mentions Alice: bad text"
+    assert payload["relationship_name"] == expected_relationship_name
+    assert payload["label"] == "contains"
+    assert payload["attributes"] == {
+        "edge_text": expected_relationship_name,
+        "note": "nul byte",
+    }
+    session.execute.assert_awaited_once_with(statement)
+    session.commit.assert_not_called()

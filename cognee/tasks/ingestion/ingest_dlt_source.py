@@ -1,0 +1,559 @@
+import asyncio
+import hashlib
+import json
+import os
+import re
+from collections import Counter
+
+from sqlalchemy import URL, text
+from sqlalchemy.ext.asyncio import create_async_engine
+
+from cognee.infrastructure.databases.postgres.admin import create_pg_database_if_not_exists
+from cognee.infrastructure.databases.relational.config import get_relational_config
+from cognee.modules.data.models import Data
+from cognee.shared.logging_utils import get_logger
+from cognee.tasks.ingestion.dlt_row_data import DltRowData, DltRows
+from cognee.tasks.ingestion.dlt_utils import (
+    NODE_SET_COLUMN,
+    NODE_SET_COLUMN_HINT,
+    document_source_tag,
+    pipeline_name_for_source,
+)
+from cognee.tasks.ingestion.exceptions.exceptions import (
+    DLTIngestionError,
+    InvalidDLTArgumentError,
+    UnsupportedDBProviderError,
+)
+from cognee.tasks.ingestion.get_dlt_destination import get_dlt_destination
+
+try:
+    import dlt
+except ImportError:
+    dlt = None
+
+logger = get_logger("ingest_dlt_source")
+
+# Serializes dlt staging runs: one shared pipeline name means one shared dlt
+# working directory, which concurrent runs corrupt (see the lock's use below).
+_staging_lock = asyncio.Lock()
+
+# Strict identifier pattern — only allow alphanumerics, underscores, dots, and hyphens
+_SAFE_IDENT_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
+
+
+async def ingest_dlt_source(
+    dlt_source,
+    dataset_name: str,
+    primary_key: str | None = None,
+    write_disposition: str = "replace",
+    max_rows_per_table: int | None = None,
+) -> DltRows:
+    """
+    Ingests a dlt (re)source by running the dlt pipeline on it.
+    Returns a list of DltRowData, one per row in the ingested tables.
+
+    Supports both SQLite and PostgreSQL as the dlt destination, based on
+    the cognee relational config.
+
+    Parameters:
+        dlt_source: The dlt resource or source to ingest.
+        dataset_name: The name of the dataset.
+        primary_key: Optional primary key column name. If not provided, auto-detected
+                     from schema or defaults to 'id' or first column.
+        write_disposition: DLT write disposition. One of:
+            - "merge" (default): Upsert rows by primary key. Existing rows with the same
+              PK are updated; new rows are inserted.
+            - "append": Always insert new rows without deduplication.
+            - "replace": Drop and recreate the table on each run.
+    Returns:
+        List[DltRowData]: Per-row data objects for downstream processing.
+    """
+
+    valid_dispositions = ("merge", "append", "replace")
+    if write_disposition not in valid_dispositions:
+        raise InvalidDLTArgumentError(
+            message=f"Invalid write_disposition '{write_disposition}'. Must be one of: {valid_dispositions}"
+        )
+
+    original_dataset_name = dataset_name
+    dataset_name = _to_safe_ident(dataset_name)
+
+    relational_config = get_relational_config()
+    dlt_db_name = f"dlt_database_{dataset_name}"
+
+    if relational_config.db_provider == "postgres":
+        await create_pg_database_if_not_exists(
+            db_name=dlt_db_name,
+            host=relational_config.db_host,
+            port=relational_config.db_port,
+            username=relational_config.db_username,
+            password=relational_config.db_password,
+        )
+
+    destination = get_dlt_destination(dlt_db_name=dlt_db_name)
+    if destination is None:
+        raise UnsupportedDBProviderError(
+            message=f"Unsupported db_provider for DLT ingestion: {relational_config.db_provider}. "
+            "Only 'sqlite' and 'postgres' are supported."
+        )
+
+    # Build run kwargs based on disposition
+    run_kwargs = {
+        "write_disposition": write_disposition,
+    }
+    # Only pass primary_key for merge disposition (required for upsert).
+    # When the user didn't provide an explicit primary_key, omit it so dlt
+    # can auto-detect PKs from the source schema per table.
+    if write_disposition == "merge" and primary_key:
+        run_kwargs["primary_key"] = primary_key
+    if document_source_tag(dlt_source):
+        # Declared before the load so a list-valued reserved column is stored as
+        # json on the row; without the hint dlt normalizes it into a child table.
+        run_kwargs["columns"] = NODE_SET_COLUMN_HINT
+
+    # Every staging run shares one dlt pipeline name, and dlt's working
+    # directory for a pipeline is NOT safe for concurrent runs: normalize's
+    # package cleanup deletes folders under the other run's feet. The add
+    # pipeline processes items concurrently (two CSVs in one add() reach the
+    # dlt_csv_loader in parallel), so staging must serialize here.
+    async with _staging_lock:
+        pipeline = dlt.pipeline(
+            pipeline_name=pipeline_name_for_source(dlt_source, original_dataset_name),
+            destination=destination,
+            dataset_name=dataset_name,
+        )
+        try:
+            # dlt's pipeline.run() is synchronous and potentially long-running;
+            # run it in a thread to avoid blocking the async event loop.
+            load_info = await asyncio.to_thread(pipeline.run, dlt_source, **run_kwargs)
+        except Exception as e:
+            raise DLTIngestionError(
+                message=f"DLT pipeline execution failed for dataset '{original_dataset_name}': {e}"
+            ) from e
+
+        # An incremental source can emit no rows (or only update its cursor),
+        # so its load package need not contain a table job. Its previously
+        # staged documents still need reconciling into Cognee: a failed
+        # cognify or a removed local item must be recoverable without editing
+        # the remote file. Scope by the CURRENT resource, never the pipeline's
+        # whole accumulated schema, which can also contain Gmail/other folders.
+        retained_tables: set[str] = set()
+        if document_source_tag(dlt_source):
+            resources = getattr(dlt_source, "resources", None)
+            resource_names = set(resources.selected) if resources is not None else {dlt_source.name}
+            retained_tables = {
+                name
+                for name, table in pipeline.default_schema.tables.items()
+                if table.get("resource") in resource_names and not table.get("parent")
+            }
+
+    # Scope the read-back to the tables this source actually loaded. The
+    # staging DB is shared per dataset, so it can still hold tables from other
+    # sources ingested earlier; reading those would leak rows across sources.
+    # Completed jobs identify tables written this time; document sources also
+    # reconcile their own retained tables on a zero-change run (above).
+    loaded_tables: set = set(retained_tables)
+    if load_info is not None:
+        for package in load_info.load_packages:
+            for job in package.jobs.get("completed_jobs", []):
+                loaded_tables.add(job.job_file_info.table_name)
+
+    # Validate load_info for failed jobs
+    if load_info is not None:
+        for package in load_info.load_packages:
+            failed_jobs = [job for job in package.jobs.get("failed_jobs", [])]
+            if failed_jobs:
+                failure_messages = [
+                    f"Table '{job.job_file_info.table_name}': {job.failed_message}"
+                    for job in failed_jobs
+                ]
+                raise DLTIngestionError(
+                    message=f"DLT load had {len(failed_jobs)} failed job(s) for dataset "
+                    f"'{original_dataset_name}':\n" + "\n".join(failure_messages)
+                )
+
+    # Extract schema from the dlt database
+    try:
+        _, filtered_schema = await _extract_dlt_schema(
+            relational_config, dlt_db_name, dataset_name, loaded_tables
+        )
+    except Exception as e:
+        raise DLTIngestionError(
+            message=f"Failed to extract schema from DLT database '{dlt_db_name}': {e}"
+        ) from e
+
+    # Read rows from each table and produce DltRowData objects
+    from cognee.tasks.ingestion.config import get_ingestion_config
+
+    default_max_rows = get_ingestion_config().dlt_max_rows_per_table
+    effective_max_rows = max_rows_per_table if max_rows_per_table is not None else default_max_rows
+    try:
+        row_data_list = await _read_rows_from_tables(
+            dlt_db_name=dlt_db_name,
+            dataset_name=dataset_name,
+            schema=filtered_schema,
+            primary_key=primary_key,
+            relational_config=relational_config,
+            max_rows_per_table=effective_max_rows,
+        )
+    except Exception as e:
+        raise DLTIngestionError(
+            message=f"Failed to read rows from DLT database '{dlt_db_name}': {e}"
+        ) from e
+
+    return DltRows(row_data_list, loaded_tables=filtered_schema)
+
+
+async def _extract_dlt_schema(
+    relational_config, dlt_db_name: str, dataset_name: str, allowed_tables: set
+):
+    """Extract and filter schema from the dlt-populated database.
+
+    Only tables in ``allowed_tables`` (the tables loaded by the current dlt
+    run) are kept — the staging DB is shared per dataset and may contain
+    tables from other sources.
+    """
+    from cognee.infrastructure.databases.relational.create_relational_engine import (
+        create_relational_engine,
+    )
+
+    # Build engine directly instead of mutating the cached migration config
+    # singleton — concurrent calls would clobber each other's settings.
+    if relational_config.db_provider == "sqlite":
+        dlt_sqlite_db_name = f"{dlt_db_name}__{dataset_name}"
+        db_path = relational_config.db_path
+        db_name = dlt_sqlite_db_name
+    else:
+        db_path = None
+        db_name = dlt_db_name
+
+    engine = create_relational_engine(
+        db_path=db_path,
+        db_name=db_name,
+        db_host=relational_config.db_host,
+        db_port=relational_config.db_port,
+        db_username=relational_config.db_username,
+        db_password=relational_config.db_password,
+        db_provider=relational_config.db_provider,
+    )
+    schema = await engine.extract_schema()
+
+    # Drop DLT's internal tables and tables not loaded by the current source.
+    # Postgres keys are schema-qualified ("dataset.table"), so the loaded-table
+    # check compares the last path component.
+    filtered_schema = {}
+    internal_tables = []
+    for qualified_name, table_info in schema.items():
+        if _is_dlt_internal_table(qualified_name):
+            internal_tables.append(qualified_name)
+            continue
+        if qualified_name.split(".")[-1] not in allowed_tables:
+            continue
+        filtered_schema[qualified_name] = table_info
+
+    if internal_tables:
+        logger.debug(
+            "Excluded %d DLT-internal table(s) from schema: %s",
+            len(internal_tables),
+            sorted(internal_tables),
+        )
+
+    return schema, filtered_schema
+
+
+def _is_dlt_internal_table(qualified_name: str) -> bool:
+    """Identify DLT's own artifacts in the staging database.
+
+    DLT's bookkeeping tables are prefixed ``_dlt_`` (_dlt_loads, _dlt_version,
+    _dlt_pipeline_state); on schema-qualified destinations its staging copies
+    live in a schema named ``{dataset}_staging``. Exact prefix/suffix matching
+    only — substring checks would silently drop user tables whose names merely
+    contain "staging" or "_dlt_" (e.g. "staging_orders", "my_dlt_exports").
+    """
+    *schema_parts, table = qualified_name.split(".")
+    if table.startswith("_dlt_"):
+        return True
+    return bool(schema_parts) and schema_parts[-1].endswith("_staging")
+
+
+def _quote_identifier(name: str) -> str:
+    """Safely quote a SQL identifier to prevent injection.
+
+    Validates the name against a strict pattern and double-quotes it.
+    Raises ValueError if the name contains unexpected characters.
+    """
+    if not _SAFE_IDENT_RE.match(name):
+        raise ValueError(
+            f"Unsafe SQL identifier rejected: {name!r}. "
+            "Only alphanumerics, underscores, dots, and hyphens are allowed."
+        )
+    # Escape any embedded double-quotes (defensive — regex above disallows them)
+    escaped = name.replace('"', '""')
+    return f'"{escaped}"'
+
+
+# What an unset reserved column reads back as: NULL, or the empty forms a
+# connector may emit for "no tags" (an empty list, or its text encodings).
+_EMPTY_RESERVED_VALUES = (None, [], "", "[]", "null")
+
+
+def _row_content_hash(row_dict: dict) -> str:
+    """Hash a row's columns (``_dlt_*`` already stripped).
+
+    The reserved node_set column is left out while it is unset, so a table
+    that merely gained the column (NULL or empty on every row) hashes exactly
+    as it did before and no existing document gets a new id. A row that sets
+    it is re-hashed like any other column change.
+    """
+    hashable = {
+        key: value
+        for key, value in row_dict.items()
+        if not (key == NODE_SET_COLUMN and value in _EMPTY_RESERVED_VALUES)
+    }
+    return hashlib.md5(json.dumps(hashable, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _compute_schema_hash(schema_info) -> str:
+    """Compute a stable hash of the schema structure for evolution detection."""
+    if isinstance(schema_info, list):
+        # SQLite format: [{"name": "col", "type": "TEXT"}, ...]
+        normalized = [(c.get("name"), c.get("type")) for c in schema_info]
+    elif isinstance(schema_info, dict):
+        # Postgres format: {"col_name": {"type": "TEXT", ...}, ...}
+        normalized = sorted((k, str(v)) for k, v in schema_info.items())
+    else:
+        normalized = str(schema_info)
+    return hashlib.md5(json.dumps(normalized, sort_keys=True).encode()).hexdigest()
+
+
+async def _read_rows_from_tables(
+    dlt_db_name: str,
+    dataset_name: str,
+    schema: dict,
+    primary_key: str | None,
+    relational_config,
+    max_rows_per_table: int = 0,
+) -> list[DltRowData]:
+    """Read rows from the dlt database tables and return DltRowData objects."""
+    if relational_config.db_provider == "sqlite":
+        # DLT creates a separate SQLite file: {db_name}__{dataset_name}
+        dlt_sqlite_db_name = f"{dlt_db_name}__{dataset_name}"
+        db_path = os.path.join(relational_config.db_path, dlt_sqlite_db_name)
+        async_url = f"sqlite+aiosqlite:///{db_path}"
+    else:
+        async_url = URL.create(
+            "postgresql+asyncpg",
+            username=relational_config.db_username,
+            password=relational_config.db_password,
+            host=relational_config.db_host,
+            port=int(relational_config.db_port),
+            database=dlt_db_name,
+        )
+
+    async_engine = create_async_engine(async_url)
+    row_data_list = []
+
+    try:
+        async with async_engine.connect() as conn:
+            for table_name, table_info in schema.items():
+                try:
+                    table_rows = await _read_single_table(
+                        conn=conn,
+                        table_name=table_name,
+                        table_info=table_info,
+                        primary_key=primary_key,
+                        dataset_name=dataset_name,
+                        dlt_db_name=dlt_db_name,
+                        relational_config=relational_config,
+                        max_rows=max_rows_per_table,
+                    )
+                    row_data_list.extend(table_rows)
+                except Exception as e:
+                    logger.error(
+                        "Failed to read table '%s' from DLT database '%s': %s",
+                        table_name,
+                        dlt_db_name,
+                        e,
+                    )
+                    raise
+    finally:
+        await async_engine.dispose()
+
+    return row_data_list
+
+
+async def _read_single_table(
+    conn,
+    table_name: str,
+    table_info: dict,
+    primary_key: str | None,
+    dataset_name: str,
+    dlt_db_name: str,
+    relational_config,
+    max_rows: int = 0,
+) -> list[DltRowData]:
+    """Read rows from a single table and return DltRowData objects.
+
+    At most ``max_rows`` rows are read.  Pass 0 or a negative value to
+    read all rows (no limit).
+    """
+    raw_columns = table_info.get("columns", [])
+    foreign_keys = table_info.get("foreign_keys", [])
+
+    # extract_schema() returns columns as a list of dicts for SQLite
+    # (e.g. [{"name": "col", "type": "TEXT"}, ...]) or a dict for Postgres
+    if isinstance(raw_columns, list):
+        column_names = [c["name"] for c in raw_columns]
+    else:
+        column_names = list(raw_columns.keys())
+
+    # Auto-detect primary key with validation
+    pk_col = _resolve_primary_key(primary_key, table_info, column_names, table_name)
+
+    # Compute schema hash for evolution detection
+    schema_hash = _compute_schema_hash(raw_columns)
+
+    # For PostgreSQL, dlt uses dataset_name as schema prefix;
+    # for SQLite, dlt uses a separate database file and tables have no prefix.
+    if relational_config.db_provider == "sqlite":
+        quoted_table = _quote_identifier(table_name)
+        query = f"SELECT * FROM {quoted_table}"
+    else:
+        schema_name, table_name_only = table_name.split(".", 1)
+        quoted_schema = _quote_identifier(schema_name)
+        quoted_tbl = _quote_identifier(table_name_only)
+        query = f"SELECT * FROM {quoted_schema}.{quoted_tbl}"
+
+    if max_rows > 0:
+        query += f" LIMIT {int(max_rows)}"
+
+    result = await conn.execute(text(query))
+    rows = result.mappings().all()
+
+    # Validate PK uniqueness
+    if rows:
+        pk_values = [str(row.get(pk_col, "")) for row in rows]
+        pk_counts = Counter(pk_values)
+        duplicates = {v: c for v, c in pk_counts.items() if c > 1}
+        if duplicates:
+            dup_sample = dict(list(duplicates.items())[:5])
+            logger.warning(
+                "Table '%s': primary key column '%s' has %d duplicate values "
+                "(sample: %s). Rows with duplicate PKs will overwrite each other "
+                "during upsert. Consider specifying a unique primary_key.",
+                table_name,
+                pk_col,
+                len(duplicates),
+                dup_sample,
+            )
+
+    row_data_list = []
+    for row in rows:
+        row_dict = {k: v for k, v in row.items()}
+        pk_value = str(row_dict.get(pk_col, ""))
+
+        row_keys = list(row_dict.keys())
+        for k in row_keys:
+            if "_dlt_" in k:
+                row_dict.pop(k)
+
+        content_hash = _row_content_hash(row_dict)
+
+        row_data_list.append(
+            DltRowData(
+                table_name=table_name,
+                primary_key_column=pk_col,
+                primary_key_value=pk_value,
+                row_data=row_dict,
+                content_hash=content_hash,
+                schema_info=raw_columns,
+                schema_hash=schema_hash,
+                foreign_keys=foreign_keys,
+                dlt_db_name=dlt_db_name,
+                dataset_name=dataset_name,
+            )
+        )
+
+    return row_data_list
+
+
+def _resolve_primary_key(
+    provided_pk: str | None,
+    table_info: dict,
+    column_names: list,
+    table_name: str = "",
+) -> str:
+    """Resolve the primary key column for a table with validation and logging."""
+    if provided_pk and provided_pk in column_names:
+        return provided_pk
+
+    if provided_pk and provided_pk not in column_names:
+        logger.warning(
+            "Table '%s': provided primary_key '%s' not found in columns %s. "
+            "Falling back to auto-detection.",
+            table_name,
+            provided_pk,
+            column_names,
+        )
+
+    # Check schema-level primary_key
+    schema_pk = table_info.get("primary_key")
+    if schema_pk:
+        if isinstance(schema_pk, list) and len(schema_pk) > 0:
+            return schema_pk[0]
+        if isinstance(schema_pk, str):
+            return schema_pk
+
+    # Fallback to 'id' column
+    if "id" in column_names:
+        logger.info("Table '%s': no explicit primary key found, using 'id' column.", table_name)
+        return "id"
+
+    # Last resort: first column (with warning)
+    if column_names:
+        logger.warning(
+            "Table '%s': no primary key detected, falling back to first column '%s'. "
+            "This may cause incorrect upsert behavior if values are not unique. "
+            "Specify primary_key explicitly for reliable deduplication.",
+            table_name,
+            column_names[0],
+        )
+        return column_names[0]
+
+    return "id"
+
+
+# Identity map over the identifier alphabet. Rebuilding the sanitized name from
+# these constant strings (dict values, not the input) makes the whitelist
+# guarantee visible to static dataflow analysis (CodeQL py/path-injection):
+# the result provably contains no path or SQL metacharacters.
+_SAFE_IDENT_CHARS = {c: c for c in "abcdefghijklmnopqrstuvwxyz0123456789_"}
+
+
+def _to_safe_ident(s: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9_]+", "_", s).strip("_").lower()
+    s = "".join(_SAFE_IDENT_CHARS.get(ch, "_") for ch in s)
+    if not s:
+        raise InvalidDLTArgumentError(message="Invalid dataset name given for dlt ingestion.")
+    if s[0].isdigit():
+        s = f"d_{s}"
+    return s[:63]
+
+
+async def migrate_dlt_database(data: list[Data]):
+    """Legacy function for migrating dlt database schema to graph database."""
+    from cognee.infrastructure.databases.graph.get_graph_engine import get_graph_engine
+    from cognee.infrastructure.files.utils.open_data_file import open_data_file
+    from cognee.tasks.ingestion.migrate_relational_database import migrate_relational_database
+
+    graph_engine = await get_graph_engine()
+
+    data_object = data[0]
+
+    async def read_json_file(path: str):
+        async with open_data_file(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    schema = await read_json_file(data_object.raw_data_location)
+
+    await migrate_relational_database(graph_db=graph_engine, schema=schema)

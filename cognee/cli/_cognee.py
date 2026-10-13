@@ -1,0 +1,436 @@
+import argparse
+import logging
+import os
+import signal
+import subprocess
+import sys
+import warnings
+from collections.abc import Sequence
+from typing import Any
+
+import click
+
+try:
+    import rich_argparse
+    from rich.markdown import Markdown
+
+    HAS_RICH = True
+except ImportError:
+    HAS_RICH = False
+
+import cognee.cli.echo as fmt
+from cognee.cli import DEFAULT_DOCS_URL, SupportsCliCommand, debug
+from cognee.cli.config import CLI_DESCRIPTION
+from cognee.cli.exceptions import CliCommandException
+from cognee.cli.remediation import REMEDIATION_MARKER, find_remediation
+from cognee.shared.logging_utils import get_logger
+
+logger = get_logger()
+
+ACTION_EXECUTED = False
+
+
+def print_help(parser: argparse.ArgumentParser) -> None:
+    if not ACTION_EXECUTED:
+        parser.print_help()
+
+
+class DebugAction(argparse.Action):
+    def __init__(
+        self,
+        option_strings: Sequence[str],
+        dest: Any = argparse.SUPPRESS,
+        default: Any = argparse.SUPPRESS,
+        help: str | None = None,
+    ) -> None:
+        super().__init__(
+            option_strings=option_strings, dest=dest, default=default, nargs=0, help=help
+        )
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: str | None = None,
+    ) -> None:
+        # Enable debug mode for stack traces
+        debug.enable_debug()
+        fmt.note("Debug mode enabled. Full stack traces will be shown.")
+
+
+class UiAction(argparse.Action):
+    def __init__(
+        self,
+        option_strings: Sequence[str],
+        dest: Any = argparse.SUPPRESS,
+        default: Any = argparse.SUPPRESS,
+        help: str | None = None,
+    ) -> None:
+        super().__init__(
+            option_strings=option_strings, dest=dest, default=default, nargs=0, help=help
+        )
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: str | None = None,
+    ) -> None:
+        # Set a flag to indicate UI should be started
+        global ACTION_EXECUTED
+        ACTION_EXECUTED = True
+        namespace.start_ui = True
+
+
+# Debug functionality is now in cognee.cli.debug module
+
+
+def _discover_commands() -> list[type[SupportsCliCommand]]:
+    """Discover all available CLI commands"""
+    # Import commands dynamically to avoid early cognee initialization
+    commands = []
+
+    command_modules = [
+        ("cognee.cli.commands.add_command", "AddCommand"),
+        ("cognee.cli.commands.search_command", "SearchCommand"),
+        ("cognee.cli.commands.cognify_command", "CognifyCommand"),
+        ("cognee.cli.commands.delete_command", "DeleteCommand"),
+        ("cognee.cli.commands.config_command", "ConfigCommand"),
+        ("cognee.cli.commands.datasets_command", "DatasetsCommand"),
+        ("cognee.cli.commands.agents_command", "AgentsCommand"),
+        ("cognee.cli.commands.sessions_command", "SessionsCommand"),
+        ("cognee.cli.commands.feedback_command", "FeedbackCommand"),
+        ("cognee.cli.commands.memify_command", "MemifyCommand"),
+        ("cognee.cli.commands.remember_command", "RememberCommand"),
+        ("cognee.cli.commands.recall_command", "RecallCommand"),
+        ("cognee.cli.commands.improve_command", "ImproveCommand"),
+        ("cognee.cli.commands.forget_command", "ForgetCommand"),
+        ("cognee.cli.commands.serve_command", "ServeCommand"),
+        ("cognee.cli.commands.eval_command", "EvalCommand"),
+        ("cognee.cli.commands.migrate_command", "UpgradeCommand"),
+        ("cognee.cli.commands.migrate_command", "DowngradeCommand"),
+        ("cognee.cli.commands.migrate_command", "HistoryCommand"),
+        ("cognee.cli.commands.migrate_command", "CurrentCommand"),
+        ("cognee.cli.commands.migrate_command", "StampCommand"),
+        ("cognee.cli.commands.push_command", "PushCommand"),
+        ("cognee.cli.commands.report_command", "ReportCommand"),
+        ("cognee.cli.commands.demo_command", "DemoCommand"),
+        ("cognee.cli.commands.doctor_command", "DoctorCommand"),
+    ]
+
+    for module_path, class_name in command_modules:
+        try:
+            module = __import__(module_path, fromlist=[class_name])
+            command_class = getattr(module, class_name)
+            commands.append(command_class)
+        except (ImportError, AttributeError) as e:
+            fmt.warning(f"Failed to load command {class_name}: {e}")
+
+    return commands
+
+
+def _create_parser() -> tuple[argparse.ArgumentParser, dict[str, SupportsCliCommand]]:
+    parser = argparse.ArgumentParser(
+        description=f"{CLI_DESCRIPTION} Further help is available at {DEFAULT_DOCS_URL}."
+    )
+
+    # Get version dynamically
+    try:
+        from cognee.version import get_cognee_version
+
+        version = get_cognee_version()
+    except ImportError:
+        version = "unknown"
+
+    parser.add_argument("--version", action="version", version=f"cognee {version}")
+    parser.add_argument(
+        "--debug",
+        action=DebugAction,
+        help="Enable debug mode to show full stack traces on exceptions",
+    )
+    parser.add_argument(
+        "-ui",
+        action=UiAction,
+        help="Start the cognee web UI interface",
+    )
+    parser.add_argument(
+        "--user-id",
+        default=None,
+        help="User/agent UUID for multi-agent isolation. Each unique ID gets its own session history and permissions. Omit to use the default user.",
+    )
+    parser.add_argument(
+        "--api-url",
+        default=None,
+        help="Delegate commands to a running Cognee API server (e.g. http://localhost:8000). "
+        "Required for multi-agent / concurrent usage with file-based databases.",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="API key sent as X-Api-Key when --api-url is set. Falls back to $COGNEE_API_KEY.",
+    )
+    parser.add_argument(
+        "--api-token",
+        default=None,
+        help="Bearer token sent as Authorization: Bearer <token> when --api-url is set. "
+        "Falls back to $COGNEE_API_TOKEN. Ignored if --api-key is also provided.",
+    )
+
+    subparsers = parser.add_subparsers(title="Available commands", dest="command")
+
+    # Discover and install commands
+    command_classes = _discover_commands()
+    installed_commands: dict[str, SupportsCliCommand] = {}
+
+    for command_class in command_classes:
+        command = command_class()
+        if command.command_string in installed_commands:
+            continue
+
+        command_parser = subparsers.add_parser(
+            command.command_string,
+            help=command.help_string,
+            description=command.description if hasattr(command, "description") else None,
+        )
+        command.configure_parser(command_parser)
+        installed_commands[command.command_string] = command
+
+    # Add rich formatting if available
+    if HAS_RICH:
+
+        def add_formatter_class(parser: argparse.ArgumentParser) -> None:
+            parser.formatter_class = rich_argparse.RichHelpFormatter
+
+            if parser.description:
+                parser.description = Markdown(parser.description, style="argparse.text")
+            for action in parser._actions:
+                if isinstance(action, argparse._SubParsersAction):
+                    for subparser in action.choices.values():
+                        add_formatter_class(subparser)
+
+        add_formatter_class(parser)
+
+    return parser, installed_commands
+
+
+class _DropUnclosedFilter(logging.Filter):
+    """Drop aiohttp's shutdown-time ``Unclosed ...`` records (keep the rest)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not record.getMessage().startswith("Unclosed ")
+
+
+def _silence_teardown_warnings() -> None:
+    """Hide aiohttp's shutdown-time "Unclosed ..." noise from the CLI.
+
+    aiohttp finalises its ClientSession / connector / connection in
+    ``__del__`` during interpreter shutdown and reports the leak through two
+    channels: a ``ResourceWarning`` (usually hidden) and the asyncio event
+    loop's exception handler, which logs an ERROR on the ``asyncio`` logger —
+    that second one is the two-line "Unclosed client session ..." noise a
+    first-time user actually sees. Neither is actionable in the CLI, so
+    silence both, surgically (only the "Unclosed" records, so genuine asyncio
+    errors still surface). Installed only for a real CLI run (not as an import
+    side effect) and skipped in debug mode so contributors still see them.
+    """
+    warnings.filterwarnings(
+        "ignore",
+        message="Unclosed (client session|connector|connection)",
+        category=ResourceWarning,
+    )
+    logging.getLogger("asyncio").addFilter(_DropUnclosedFilter())
+
+
+def main() -> int:
+    """Main CLI entry point"""
+    # Operations run from this process record origin="cli" in pipeline_runs.
+    # ContextVars set here propagate into every asyncio.run() a command makes.
+    from cognee.modules.operations import ORIGIN_CLI, set_operation_origin
+
+    set_operation_origin(ORIGIN_CLI)
+
+    parser, installed_commands = _create_parser()
+    args = parser.parse_args()
+
+    if not debug.is_debug_enabled():
+        _silence_teardown_warnings()
+
+    # Handle UI flag
+    if hasattr(args, "start_ui") and args.start_ui:
+        spawned_pids = []
+        docker_container = None
+
+        def signal_handler(signum, frame):
+            """Handle Ctrl+C and other termination signals"""
+            nonlocal spawned_pids, docker_container
+
+            try:
+                fmt.echo("\nShutting down UI server...")
+            except (BrokenPipeError, OSError):
+                pass
+
+            # Teardown lives in cognee.api.v1.ui.ui, which owns the processes and
+            # the container. Reimplementing it here is how the two drifted: this
+            # handler used to resolve os.getpgid(pid) first, which fails in exactly
+            # the case start_ui cares about -- npm's parent exiting before its
+            # Node child -- while start_ui signals the original group id.
+            from cognee.api.v1.ui.ui import remove_ui_container, stop_ui_pid
+
+            if docker_container:
+                remove_ui_container(docker_container)
+                try:
+                    fmt.success(f"✓ Docker container {docker_container} stopped.")
+                except (BrokenPipeError, OSError):
+                    pass
+
+            for pid in spawned_pids:
+                stop_ui_pid(pid)
+                try:
+                    fmt.success(f"✓ Process {pid} and its children terminated.")
+                except (BrokenPipeError, OSError):
+                    pass
+
+            sys.exit(0)
+
+        signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
+        signal.signal(signal.SIGTERM, signal_handler)  # Termination request
+        if hasattr(signal, "SIGHUP"):
+            signal.signal(signal.SIGHUP, signal_handler)
+
+        try:
+            from cognee import start_ui
+
+            fmt.echo("Starting cognee UI...")
+
+            # Callback to capture PIDs and Docker container of all spawned processes
+            def pid_callback(pid_or_tuple):
+                nonlocal spawned_pids, docker_container
+                # Handle both regular PIDs and (PID, container_name) tuples
+                if isinstance(pid_or_tuple, tuple):
+                    pid, container_name = pid_or_tuple
+                    spawned_pids.append(pid)
+                    docker_container = container_name
+                else:
+                    spawned_pids.append(pid_or_tuple)
+
+            frontend_port = 3000
+            start_backend, backend_port = True, 8000
+            start_mcp, mcp_port = True, 8001
+            server_process = start_ui(
+                pid_callback=pid_callback,
+                port=frontend_port,
+                open_browser=True,
+                auto_download=True,
+                start_backend=start_backend,
+                backend_port=backend_port,
+                start_mcp=start_mcp,
+                mcp_port=mcp_port,
+            )
+
+            if server_process:
+                fmt.success("UI server started successfully!")
+                fmt.echo(f"The interface is available at: http://localhost:{frontend_port}")
+                if start_backend:
+                    fmt.echo(f"The API backend is available at: http://localhost:{backend_port}")
+                if start_mcp and docker_container:
+                    fmt.echo(f"The MCP server is available at: http://localhost:{mcp_port}")
+                elif start_mcp:
+                    fmt.note(
+                        "The optional MCP server was skipped or failed to start; see logs above."
+                    )
+                fmt.note("Press Ctrl+C to stop the server...")
+
+                try:
+                    # Keep the server running
+                    import time
+
+                    while server_process.poll() is None:  # While process is still running
+                        time.sleep(1)
+                except KeyboardInterrupt:
+                    # This shouldn't happen now due to signal handler, but kept for safety
+                    signal_handler(signal.SIGINT, None)
+
+                return 0
+            else:
+                # No teardown here: start_ui cleans up everything it started before
+                # returning None. Calling signal_handler again would be a second
+                # teardown against PIDs that are already gone -- and if the OS had
+                # recycled one, it would signal an unrelated process group.
+                fmt.error("Failed to start UI server. Check the logs above for details.")
+                return 1
+
+        except Exception as ex:
+            fmt.error(f"Error starting UI: {ex!s}")
+            signal_handler(signal.SIGTERM, None)
+            if debug.is_debug_enabled():
+                raise
+            return 1
+
+    # When --api-url is set, delegate to the API server instead of running
+    # in-process.  This is the correct mode for concurrent / multi-agent use
+    # with file-based databases (SQLite, Ladybug, LanceDB).
+    from cognee.cli.api_dispatch import can_dispatch
+    from cognee.cli.api_dispatch import dispatch as api_dispatch
+
+    if can_dispatch(args) and args.command:
+        try:
+            api_dispatch(args)
+        except Exception as ex:
+            # Keep the friendly console message, but always log the full
+            # exception (type + traceback) so delegated-command failures stay
+            # diagnosable in CI/production even when --debug is off.
+            # See issue #3335.
+            logger.exception("Delegated command failed")
+            fmt.error(str(ex))
+            if debug.is_debug_enabled():
+                raise
+            return 1
+        return 0
+
+    if cmd := installed_commands.get(args.command):
+        try:
+            cmd.execute(args)
+        except Exception as ex:
+            docs_url = cmd.docs_url if hasattr(cmd, "docs_url") else DEFAULT_DOCS_URL
+            error_code = -1
+            raiseable_exception = ex
+
+            # Handle CLI-specific exceptions
+            if isinstance(ex, CliCommandException):
+                error_code = ex.error_code
+                docs_url = ex.docs_url or docs_url
+                raiseable_exception = ex.raiseable_exception
+
+            # Print exception
+            fmt.error(str(ex))
+
+            # Surface a prescriptive next step for known first-run failure
+            # modes between the error line and the generic docs pointer, so
+            # the actionable fix sits directly under the error it addresses.
+            error_text = str(ex)
+            hint = None if REMEDIATION_MARKER in error_text else find_remediation(error_text)
+            if hint:
+                fmt.note(hint)
+
+            fmt.note(f"Please refer to our docs at '{docs_url}' for further assistance.")
+
+            if debug.is_debug_enabled() and raiseable_exception:
+                raise raiseable_exception from ex
+
+            return error_code
+    else:
+        print_help(parser)
+        return -1
+
+    return 0
+
+
+def _main() -> None:
+    """Script entry point"""
+    sys.exit(main())
+
+
+if __name__ == "__main__":
+    sys.exit(main())
