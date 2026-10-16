@@ -12,7 +12,7 @@ export default async function Page({
 }) {
   const params = await searchParams;
 
-  // No verified param — not coming from Auth0 redirect
+  // No verified param not coming from Auth0 redirect
   if (params.verified !== "true") {
     return redirect("/sign-in");
   }
